@@ -78,8 +78,8 @@ class Bird(data.Dataset):
         keypoints = np.array(keypoints)
 
         if self.split == "train":
-            return self.train_transform(img, keypoints)
-        return self.test_transform(img), len(keypoints), name
+            return img_path, *self.train_transform(img, keypoints)
+        return img_path, self.test_transform(img), len(keypoints), name
 
     def test_transform(self, img):
         trans = transforms.Compose(
