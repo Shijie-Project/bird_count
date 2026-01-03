@@ -51,7 +51,7 @@ def main():
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
-    model.load_state_dict(torch.load(args.checkpoint))
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     model.to(device)
     model.eval()
 

@@ -1,0 +1,9 @@
+ffmpeg -re -stream_loop -1 \
+  -i bird_count_demo.mp4 \
+  -vf fps=10 \
+  -c:v libx264 \
+  -preset ultrafast \
+  -tune zerolatency \
+  -g 20 -keyint_min 20 \
+  -bf 0 \
+  -f rtsp rtsp://127.0.0.1:8554/live/test

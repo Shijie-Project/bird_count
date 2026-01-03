@@ -1,5 +1,8 @@
 import logging
 import os
+import time
+
+import cv2
 
 
 class SaveHandle:
@@ -70,3 +73,91 @@ class Logger:
 
     def info(self, msg):
         self.logger.info(msg)
+
+
+class SimulatedCamera:
+    """
+    Simulates a real-time camera stream using a video file.
+    It blocks in .grab() to strictly match the target FPS, preventing
+    the "fast-forward" effect when reading files.
+    """
+
+    def __init__(self, video_path, target_fps=None, loop=True):
+        self.cap = cv2.VideoCapture(video_path)
+        self.video_path = video_path
+        self.loop = loop
+
+        if not self.cap.isOpened():
+            raise ValueError(f"Could not open video file: {video_path}")
+
+        # Determine FPS
+        if target_fps is None:
+            self.target_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        else:
+            self.target_fps = target_fps
+
+        self.frame_interval = 1.0 / self.target_fps
+
+        # Timing control
+        self.frame_counter = 0
+        self.start_time = time.perf_counter()
+
+    def grab(self):
+        """
+        Simulate the blocking behavior of a real camera.
+        Waits until the correct time to fetch the next frame.
+        """
+        # --- 1. Timing Logic (Drift-Free) ---
+        # Calculate when the next frame *should* be captured relative to start
+        target_time = self.start_time + (self.frame_counter * self.frame_interval)
+        now = time.perf_counter()
+
+        # If we are ahead of schedule, sleep precisely the difference
+        time_to_wait = target_time - now
+        if time_to_wait > 0:
+            time.sleep(time_to_wait)
+        else:
+            # Optional: If we represent a live stream, and we are falling way behind,
+            # strict timing might reset the baseline to avoid "catching up" quickly.
+            # But for simple simulation, just proceeding is fine.
+            pass
+
+        # --- 2. Grab Frame ---
+        ret = self.cap.grab()
+
+        # --- 3. Handle Loop (End of File) ---
+        if not ret and self.loop:
+            # Rewind to beginning
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.start_time = time.perf_counter()  # Reset clock to avoid huge jump
+            self.frame_counter = 0
+            ret = self.cap.grab()
+
+        if ret:
+            self.frame_counter += 1
+
+        return ret
+
+    def retrieve(self, *args, **kwargs):
+        """
+        Just wraps the underlying retrieve.
+        """
+        return self.cap.retrieve(*args, **kwargs)
+
+    def read(self):
+        """
+        Standard read: grab + retrieve
+        """
+        if self.grab():
+            return self.retrieve()
+        return False, None
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self.cap.release()
+
+    def set(self, propId, value):
+        # Allow setting properties, though buffering/timeouts won't affect files much
+        self.cap.set(propId, value)
