@@ -2,11 +2,10 @@ import logging
 import multiprocessing as mp
 import os
 import queue
-import signal
 import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pprint import pformat
 from typing import Optional
 
@@ -20,11 +19,11 @@ from utils import SimulatedCamera
 
 logging.basicConfig(
     level=logging.INFO if os.getenv("DEBUG", "0") == "0" else logging.DEBUG,
-    format="%(asctime)s | %(levelname)s | %(processName)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("InferenceEngine")
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore")
 
 
 # --- Define Types ---
@@ -36,335 +35,418 @@ ResultItem = tuple[list[int], torch.Tensor, torch.Tensor]
 # --- Setup Logging ---
 @dataclass
 class Config:
-    # Model
-    model_path: str = "./ckpts/shufflenet_model_best.pth"
+    # --- Core Parameters (Adjust these to control performance) ---
+    TARGET_FPS: float = 10.0  # Target FPS per stream. All timeouts are derived from this.
+    NUM_STREAMS: int = 4  # Number of concurrent video streams.
 
-    # GPUs
-    available_gpus: tuple[int, ...] = (0,)
-    workers_per_gpu: int = 1  # usually 1 per GPU
+    # Model Settings
+    MODEL_PATH: str = "./ckpts/shufflenet_model_best.pth"
+    INPUT_SIZE: tuple[int, int] = (512, 512)
 
-    # Streams
-    use_video: bool = False
-    sources: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
-    video_sources: tuple[str, ...] = ("./data/bird_count/bird_count_demo.mp4",)
+    # Hardware Settings
+    AVAILABLE_GPUS: tuple[int, ...] = (0,)
+    WORKERS_PER_GPU: int = 1
 
-    num_streams: int = 22
-    target_fps_per_stream: float = 10.0  # load-test knob (per stream)
+    # 数据源
+    USE_VIDEO: bool = False
+    RTSP_URL: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
+    VIDEO_FILE: tuple[str, ...] = ("./data/bird_count/bird_count_demo.mp4",)
 
-    # Preprocess
-    input_size: tuple[int, int] = (512, 512)
+    # 运行时长 (None 为无限)
+    RUNTIME_SECONDS: Optional[int] = None
 
-    # Video Capture
-    open_timeout_ms: int = 5000  # best-effort: some backends ignore this
-    runtime_seconds: Optional[int] = None  # None -> run until Ctrl+C
-
-    # Monitoring
-    enable_monitor: bool = True
+    # --- 2. 自动计算的参数 (不要手动改) ---
+    frame_interval_s: float = field(init=False)
+    max_batch_wait_s: float = field(init=False)
+    stream_sources: tuple[str, ...] = field(init=False)
 
     def __post_init__(self):
-        stream_sources = self.video_sources if self.use_video else self.sources
-        if len(stream_sources) == 0:
-            raise ValueError("No stream sources found.")
+        # A. 计算帧间隔
+        self.frame_interval_s = 1.0 / max(0.1, self.TARGET_FPS)
 
-        if len(stream_sources) < self.num_streams:
-            repeats = self.num_streams // len(stream_sources) + 1
-            stream_sources = tuple(stream_sources) * repeats
-        self.stream_sources = stream_sources[: self.num_streams]
+        # B. 动态超时策略：
+        # 允许主进程为了凑 Batch 最多等待帧间隔的 15%
+        # 留 85% 的时间给数据传输和 GPU 计算，确保不积压
+        self.max_batch_wait_s = self.frame_interval_s * 0.15
 
-        assert len(self.stream_sources) == self.num_streams
-        logging.info(f"Stream sources:\n{pformat(self.stream_sources)}")
+        # C. 源设置
+        sources = self.VIDEO_FILE if self.USE_VIDEO else self.RTSP_URL
+        if len(sources) < self.NUM_STREAMS:
+            sources = sources * (self.NUM_STREAMS // len(sources) + 1)
+        self.stream_sources = tuple(sources[: self.NUM_STREAMS])
+
+        logger.info("--- Configuration ---")
+        logger.info(f"Target FPS: {self.TARGET_FPS} (Interval: {self.frame_interval_s * 1000:.1f}ms)")
+        logger.info(f"Batch Wait Budget: {self.max_batch_wait_s * 1000:.1f}ms (15% of interval)")
+        logger.info(f"Streams: {self.NUM_STREAMS}")
+        logger.info(f"Source(s):\n{pformat(self.stream_sources)}")
 
 
-# --- Frame Grabber (Thread) ---
+# --- 1. 抓帧线程 (Frame Grabber) ---
 class FrameGrabber(threading.Thread):
     def __init__(
         self,
-        stream_id: int,
+        sid: int,
         src: str,
-        input_size: tuple[int, int],
-        frame_queue: "mp.Queue[GrabberItem]",
+        queue_out: "mp.Queue[GrabberItem]",
         stop_event: threading.Event,
-        target_fps: float,
-        open_timeout_ms: int,
+        cfg: Config,
     ) -> None:
-        super().__init__(daemon=True, name=f"grabber-{stream_id}")
-        self.stream_id = stream_id
+        super().__init__(daemon=True, name=f"grabber-{sid}")
+        self.sid = sid
         self.src = src
-        self.input_size = input_size
-        self.frame_queue = frame_queue
+        self.queue_out = queue_out
         self.stop_event = stop_event
-        self.target_fps = target_fps
-        self.open_timeout_ms = open_timeout_ms
+        self.cfg = cfg
 
-        self._target_period_s = 1.0 / max(1.0, target_fps)
+        # Limit the capture rate
+        self._target_period_s = 1.0 / max(1.0, self.cfg.TARGET_FPS)
+        self._last_emit = 0.0
         self._start_time = time.perf_counter()
-        self._last_emit = time.perf_counter()
 
     def run(self) -> None:
+        # --- Outer Loop: Handles Connection & Reconnection ---
         while not self.stop_event.is_set():
-            # --- 1. Reconnection Loop ---
+            # 1. Attempt Connection
             if os.path.exists(self.src):
-                cap = SimulatedCamera(self.src, target_fps=self.target_fps)
+                cap = SimulatedCamera(self.src, target_fps=self.cfg.TARGET_FPS)
             else:
                 cap = cv2.VideoCapture(self.src)
-
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.open_timeout_ms)
-                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.open_timeout_ms)
-            except Exception:
-                pass
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    # Set timeouts to avoid hanging indefinitely
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                except Exception:
+                    pass
 
             if not cap.isOpened():
-                logging.error(f"Stream {self.stream_id}: Failed to open {self.src}. Retrying in 5s...")
+                logger.error(f"Stream {self.sid}: Failed to open {self.src}. Retrying in 5s...")
                 cap.release()
                 time.sleep(5)
                 continue
 
-            logging.info(f"Stream {self.stream_id}: Connected.")
+            logger.info(f"Stream {self.sid}: Connected.")
 
-            # --- 2. Reading Loop ---
+            # --- Inner Loop: Frame Reading ---
             last_success_time = time.perf_counter()
 
             while not self.stop_event.is_set():
+                # Use grab() to check for availability (faster than retrieve)
                 ret = cap.grab()
 
                 if not ret:
-                    if time.perf_counter() - last_success_time > 5:
-                        # if do not receive any frames for the last 5 seconds, assume connection lost and reconnect
-                        logging.warning(f"Stream {self.stream_id}: Connection lost. Reconnecting...")
-                        break  # reconnect
+                    # Connection Watchdog: If no frames for 5s, break to reconnect
+                    if time.perf_counter() - last_success_time > 5.0:
+                        logger.warning(f"Stream {self.sid}: Connection lost (timeout). Reconnecting...")
+                        break  # Break inner loop -> Trigger outer loop reconnection
 
                     time.sleep(0.01)
-                    continue  # re-grab
+                    continue
 
                 now = time.perf_counter()
                 last_success_time = now
 
+                # FPS Throttling: Skip frame if we are reading too fast
+                # (Crucial for files, optional for RTSP depending on backend)
                 if now - self._last_emit < self._target_period_s:
                     time.sleep(0.001)
-                    continue  # re-grap
+                    continue
 
+                # Actual Decode
                 ret, frame = cap.retrieve()
                 if not ret:
                     continue
 
-                frame = cv2.resize(frame, self.input_size)
+                # --- Optimization Start ---
+                # 1. Resize on CPU
+                frame = cv2.resize(frame, self.cfg.INPUT_SIZE)
+                # 2. Convert Color (Keep uint8)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # --- Optimization End ---
 
+                self._last_emit = now
                 try:
-                    self.frame_queue.put_nowait((self.stream_id, frame, time.time()))
-                    self._last_emit = now
-
+                    # Load Shedding: Drop frame if queue is full
+                    self.queue_out.put_nowait((self.sid, frame, time.time()))
                 except queue.Full:
                     if now - self._start_time > 10.0:
-                        logger.debug(f"Stream {self.stream_id}: Queue full, dropped old frame.")
-
+                        logger.debug(f"Stream {self.sid}: Queue full, dropped old frame.")
+                    pass
                 except Exception as e:
-                    logging.error(f"Stream {self.stream_id} processing error: {e}")
+                    logger.error(f"Stream {self.sid} processing error: {e}")
 
+            # Clean up before reconnecting
             cap.release()
+            logger.info(f"Stream {self.sid}: Disconnected/Reconnecting...")
 
-        logging.info(f"Stream {self.stream_id}: Disconnected!")
+        logger.info(f"Stream {self.sid}: Thread Stopped.")
 
 
-# --- Inference worker (process) ---
+# --- 2. Inference Worker Process ---
 def inference_worker(
     worker_id: int,
-    device_index: int,
+    gpu_id: int,
     cfg: Config,
     task_queue: "mp.Queue[TaskItem]",
     result_queue: "mp.Queue[ResultItem]",
     shutdown: "mp.Event",
 ) -> None:
+    """
+    GPU Worker. Handles data transfer to GPU, preprocessing, and inference.
+    """
+    # Initialize CUDA
+    device = torch.device(f"cuda:{gpu_id}")
+    torch.cuda.set_device(device)
+
+    # Enable cuDNN benchmark for fixed input sizes
     torch.backends.cudnn.benchmark = True
 
-    device = torch.device(f"cuda:{device_index}")
-    logging.info(f"Worker {worker_id}: connected on {device}.")
+    model = ShuffleNetV2_x1_0()
+    try:
+        st = torch.load(cfg.MODEL_PATH, map_location=device)
+        model.load_state_dict(st)
+    except Exception as e:
+        logger.error(f"Worker {worker_id}: Load model failed: {e}")
+        return
 
-    model = ShuffleNetV2_x1_0().to(device)
-    state = torch.load(cfg.model_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
+    model.to(device).eval()
 
+    # Optimization: Pre-allocate constants on GPU to avoid repetitive transfers
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
+    logger.info(f"[Worker {worker_id}] Initialized on GPU {gpu_id}.")
+
     while not shutdown.is_set():
         try:
-            batch_data = task_queue.get(timeout=0.1)
-        except Exception:
+            # Wait for a batch of data.
+            # Timeout is short to allow checking the shutdown event.
+            batch_data = task_queue.get(timeout=0.05)
+        except queue.Empty:
             continue
 
-        stream_ids, x_cpu = batch_data
-        x_cpu = x_cpu.float().permute(0, 3, 1, 2)
+        stream_ids, frames_uint8 = batch_data
 
-        input_tensor = x_cpu.to(device, non_blocking=True).div(255.0)
-        input_tensor = (input_tensor - mean) / std
-
-        t_infer_start = time.perf_counter()
+        # Optimization: Full GPU Preprocessing Pipeline
+        # Input: uint8 CPU Tensor -> GPU -> Float -> Normalize
         try:
+            # 1. Async transfer to GPU (Non-blocking)
+            input_tensor = frames_uint8.to(device, non_blocking=True)
+
+            # 2. Permute: (B, H, W, 3) -> (B, 3, H, W)
+            input_tensor = input_tensor.permute(0, 3, 1, 2)
+
+            # 3. Cast to float and Normalize (Leveraging GPU parallel power)
+            input_tensor = input_tensor.float().div(255.0)
+            input_tensor = (input_tensor - mean) / std
+
+            # 4. Inference with Automatic Mixed Precision (AMP) for FP16 speedup
             with torch.inference_mode():
                 with torch.amp.autocast("cuda"):
                     outputs, _ = model(input_tensor)
-                # Ensure synchronization if timing is critical
-                torch.cuda.synchronize()
 
-            t_infer_done = time.perf_counter()
-            logger.debug(f"processed with {t_infer_done - t_infer_start:.3f}s")
+            # 5. Result Transfer
+            # Move only the necessary output (density map) back to CPU
+            out_cpu = outputs.detach().half().cpu()
 
-            out_cpu = outputs.detach().float().cpu()
-
-            # Send results back
-            try:
-                result_queue.put_nowait((stream_ids, x_cpu, out_cpu))
-            except queue.Full:
-                logger.debug("Result queue full, dropping batch.")
-            except Exception as e:
-                logger.error(f"Worker {worker_id}: Failed to put result. Error: {e}")
+            result_queue.put((stream_ids, out_cpu, frames_uint8))
 
         except Exception as e:
-            logging.error(f"Inference error: {e}")
+            logger.error(f"[Worker {worker_id}] Inference Error: {e}")
 
-    logging.info(f"Worker {worker_id} shutting down")
+    logger.info(f"[Worker {worker_id}] Shutdown.")
 
 
-def run(cfg: Config) -> None:
+# --- 3. Main Scheduler Loop ---
+def run_scheduler(cfg: Config) -> None:
+    """
+    Main Loop: Collects frames -> Forms batches -> Dispatches to GPU Workers.
+    Implements 'Bucket Accumulation with Timeout' strategy.
+    """
     ctx = mp.get_context("spawn")
     shutdown = ctx.Event()
 
-    # Stream grabbers -> per stream latest queue (size=1)
-    per_stream_queues: list["mp.Queue[GrabberItem]"] = [ctx.Queue(maxsize=1) for _ in range(cfg.num_streams)]
+    # A. Initialize Per-Stream Input Queues (Maxsize=1 ensures freshness)
+    stream_queues: list["mp.Queue[GrabberItem]"] = [ctx.Queue(maxsize=1) for _ in range(cfg.NUM_STREAMS)]
 
+    # B. Start Frame Grabber Threads
     stop_event = threading.Event()
-    grabbers: list[FrameGrabber] = []
-    for sid, (src, q) in enumerate(zip(cfg.stream_sources, per_stream_queues)):
-        t = FrameGrabber(
-            stream_id=sid,
-            src=src,
-            frame_queue=q,
-            input_size=cfg.input_size,
-            stop_event=stop_event,
-            target_fps=cfg.target_fps_per_stream,
-            open_timeout_ms=cfg.open_timeout_ms,
-        )
+    grabbers = []
+    for i, src in enumerate(cfg.stream_sources):
+        t = FrameGrabber(i, src, stream_queues[i], stop_event, cfg)
         t.start()
         grabbers.append(t)
 
-    # GPU workers
-    gpu_worker_specs: list[tuple[int, int]] = []
-    for gpu in cfg.available_gpus:
-        for _ in range(max(1, cfg.workers_per_gpu)):
-            gpu_worker_specs.append((gpu, len(gpu_worker_specs)))
+    # C. Setup Workers and Queues
+    total_workers = len(cfg.AVAILABLE_GPUS) * cfg.WORKERS_PER_GPU
 
-    result_queue: "mp.Queue[ResultItem]" = ctx.Queue(maxsize=1)
-    task_queues: list["mp.Queue[TaskItem]"] = [ctx.Queue(maxsize=1) for _ in gpu_worker_specs]
+    # Task Queue: CPU -> GPU (Buffer size 2 to pipeline batches)
+    task_queues: list["mp.Queue[TaskItem]"] = [ctx.Queue(maxsize=2) for _ in range(total_workers)]
+    # Result Queue: GPU -> CPU
+    result_queue: "mp.Queue[ResultItem]" = ctx.Queue(maxsize=total_workers * 2)
 
-    workers: list[mp.Process] = []
-    for (gpu, wid), tq in zip(gpu_worker_specs, task_queues):
-        p = ctx.Process(
-            target=inference_worker,
-            args=(wid, gpu, cfg, tq, result_queue, shutdown),
-            name=f"gpu-worker-{wid}-cuda{gpu}",
-            daemon=True,
-        )
-        p.start()
-        workers.append(p)
+    workers = []
+    worker_idx = 0
+    for gpu in cfg.AVAILABLE_GPUS:
+        for _ in range(cfg.WORKERS_PER_GPU):
+            p = ctx.Process(
+                target=inference_worker,
+                args=(worker_idx, gpu, cfg, task_queues[worker_idx], result_queue, shutdown),
+                name=f"worker-{worker_idx}",
+                daemon=True,
+            )
+            p.start()
+            workers.append(p)
+            worker_idx += 1
 
-    time.sleep(5)  # wait for setup
+    # D. Scheduling Constants
+    # Distribute streams evenly across workers (Round-Robin)
+    streams_per_worker = (cfg.NUM_STREAMS + total_workers - 1) // total_workers
+    target_batch_size = streams_per_worker
 
-    # SIG handler
-    def _handle_stop(_sig: int, _frame: object) -> None:
-        stop_event.set()
-        shutdown.set()
+    # Buffer for accumulating frames: pending_batches[worker_id] = [item1, item2...]
+    pending_batches: list[list[GrabberItem]] = [[] for _ in range(total_workers)]
+    batch_start_times: list[Optional[float]] = [None] * total_workers
 
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
+    logger.info(f"Scheduler: Managing {cfg.NUM_STREAMS} streams with {total_workers} workers.")
+    logger.info(f"Scheduler: Target Batch Size = {target_batch_size}")
 
-    # Stream -> worker mapping (round-robin)
-    stream_to_worker = {sid: sid % len(task_queues) for sid in range(cfg.num_streams)}
+    # E. Main Execution Loop
+    time.sleep(3)  # Wait for workers to initialize
+    start_time = time.time()
 
-    t_start_wall = time.time()
+    total_frames_processed = 0
+    fps_log_time = time.time()
+
     try:
         while not shutdown.is_set():
-            if cfg.runtime_seconds is not None and (time.time() - t_start_wall) >= cfg.runtime_seconds:
-                logging.info("Reached runtime_seconds=%s, stopping.", cfg.runtime_seconds)
+            # Check runtime limit
+            if cfg.RUNTIME_SECONDS and (time.time() - start_time > cfg.RUNTIME_SECONDS):
+                logger.info("Runtime limit reached.")
                 break
 
-            worker_batches: list[list[GrabberItem]] = [[] for _ in range(len(task_queues))]
-
-            # Check all stream queues
-            for sid, q in enumerate(per_stream_queues):
-                try:
-                    # Get frame if available
-                    item = q.get_nowait()  # (sid, tensor)
-                    widx = stream_to_worker[sid]
-                    worker_batches[widx].append(item)
-                except Exception:
-                    continue
-
-            # Send Batches to Workers
             did_work = False
-            for widx, batch_items in enumerate(worker_batches):
-                if not batch_items:
+            now = time.perf_counter()
+
+            # --- Phase 1: Data Collection ---
+            # Poll all stream queues for new data
+            for sid, q in enumerate(stream_queues):
+                try:
+                    # Non-blocking get
+                    item = q.get_nowait()  # (sid, frame, ts)
+
+                    # Determine target worker (Round-Robin)
+                    w_idx = sid % total_workers
+
+                    # If this is the first item in the batch, start the timer
+                    if not pending_batches[w_idx]:
+                        batch_start_times[w_idx] = now
+
+                    pending_batches[w_idx].append(item)
+                    did_work = True
+                except queue.Empty:
+                    pass
+
+            # --- Phase 2: Batch Dispatch ---
+            # Check accumulated buffers for each worker
+            for w_idx in range(total_workers):
+                batch = pending_batches[w_idx]
+                if not batch:
                     continue
 
-                did_work = True
-                received_frames = sum(len(batch) > 0 for batch in batch_items)
-                logger.debug(f"Worker{widx}: Received {received_frames} frames.")
+                # Dispatch Conditions:
+                # 1. Batch is Full: We have enough frames to saturate the worker.
+                # 2. Timeout: The first frame has waited too long. We must dispatch
+                #    to maintain FPS, even if the batch is not full.
+                is_full = len(batch) >= target_batch_size
+                time_waited = now - batch_start_times[w_idx]
+                is_timeout = time_waited > cfg.max_batch_wait_s
 
-                # Construct the batch properly here
-                sids = [x[0] for x in batch_items]
-                tensors = torch.from_numpy(np.stack([x[1] for x in batch_items]))
+                if is_full or is_timeout:
+                    # Extract IDs and Stack Frames
+                    sids = [x[0] for x in batch]
+                    # Stack numpy arrays into a single block (B, H, W, 3)
+                    frames = np.stack([x[1] for x in batch])
 
-                try:
-                    task_queues[widx].put_nowait((sids, tensors))
-                except Exception:
-                    logger.debug("Task queue full, dropping batch.")
+                    # Convert to Tensor (Share memory efficiently with uint8)
+                    tensor_uint8 = torch.from_numpy(frames)
+                    logger.debug(f"Worker {w_idx}: Dispatched batch of {len(sids)} frames.")
+                    try:
+                        task_queues[w_idx].put_nowait((sids, tensor_uint8))
+                        # Batch sent successfully, clear buffer
+                        pending_batches[w_idx] = []
+                        batch_start_times[w_idx] = None
+                        did_work = True
+                    except queue.Full:
+                        # Drop Strategy:
+                        # If worker queue is full, it means GPU is lagging.
+                        # We drop the accumulated batch to prioritize realtime latency.
+                        pending_batches[w_idx] = []
+                        batch_start_times[w_idx] = None
+                        logger.warning(f"Worker {w_idx} busy, dropping batch.")
 
+            # --- Phase 3: Result Harvesting ---
+            # Retrieve results to prevent queue blocking.
+            # (In a real app, you would send these to a Monitor/Visualization process)
             while True:
                 try:
-                    _ = result_queue.get_nowait()
-                except Exception:
+                    res = result_queue.get_nowait()
+                    # res: (sids, density_maps)
+                    total_frames_processed += len(res[0])
+                    did_work = True
+                except queue.Empty:
                     break
 
-            if not did_work:
-                time.sleep(0.001)  # Prevent CPU spin
+            # --- Phase 4: Logging ---
+            if time.time() - fps_log_time > 5.0:
+                dur = time.time() - fps_log_time
+                fps = total_frames_processed / dur
+                logger.info(f"System Throughput: {fps:.1f} FPS (Target: {cfg.NUM_STREAMS * cfg.TARGET_FPS})")
+                total_frames_processed = 0
+                fps_log_time = time.time()
 
+            # --- Phase 5: CPU Idle Optimization ---
+            # If no work was done, sleep briefly to avoid 100% CPU usage
+            if not did_work:
+                time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
     finally:
         stop_event.set()
         shutdown.set()
 
-        # teardown workers
-        for _ in range(60):
-            if all(not p.is_alive() for p in workers):
-                break
-            time.sleep(0.05)
-
+        # Cleanup Workers
         for p in workers:
             if p.is_alive():
                 p.terminate()
-            p.join(timeout=1.0)
-
-        logging.info("Stopped.")
+        logger.info("Shutdown complete.")
 
 
-def main() -> None:
-    # You can set CUDA_VISIBLE_DEVICES="0,1" etc.
+def main():
+    # Environment variable overrides for easy testing
+    target_fps = float(os.getenv("FPS", "10.0"))
+    num_streams = int(os.getenv("NUM_STREAMS", "22"))
+    use_video = os.getenv("USE_VIDEO", "0") == "1"
+
     visible = os.getenv("CUDA_VISIBLE_DEVICES", "0").strip()
     gpus = tuple(int(x) for x in visible.split(",") if x.strip() != "")
+
     cfg = Config(
-        available_gpus=gpus if gpus else (0,),
-        workers_per_gpu=1,
-        num_streams=4,
-        target_fps_per_stream=10.0,
-        use_video=os.getenv("USE_VIDEO", "0") == "1",
-        runtime_seconds=None,
-        enable_monitor=True,
+        TARGET_FPS=target_fps,
+        NUM_STREAMS=num_streams,
+        AVAILABLE_GPUS=gpus if gpus else (0,),
+        WORKERS_PER_GPU=1,
+        USE_VIDEO=use_video,
+        RUNTIME_SECONDS=None,
     )
-    run(cfg)
+
+    logger.info("Starting Optimized Inference Engine...")
+    run_scheduler(cfg)
 
 
 if __name__ == "__main__":
+    # Required for CUDA
     mp.set_start_method("spawn", force=True)
     main()
