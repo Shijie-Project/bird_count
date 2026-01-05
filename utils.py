@@ -1,11 +1,8 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
 
 import cv2
-import numpy as np
-import torch
 
 
 class SaveHandle:
@@ -164,30 +161,3 @@ class SimulatedCamera:
     def set(self, propId, value):
         # Allow setting properties, though buffering/timeouts won't affect files much
         self.cap.set(propId, value)
-
-
-@dataclass
-class GrabberItem:
-    """Data sent from FrameGrabber to Scheduler"""
-
-    sid: int
-    frame: np.ndarray  # uint8 array
-    timestamp: float  # time.time()
-
-
-@dataclass
-class TaskItem:
-    """Data sent from Scheduler to GPU Worker"""
-
-    sids: list[int]
-    frames: torch.Tensor  # CPU Tensor (B, H, W, 3)
-    timestamps: list[float]  # For latency calculation
-
-
-@dataclass
-class ResultItem:
-    """Data sent from GPU Worker back to Scheduler/Monitor"""
-
-    sids: list[int]
-    density_maps: torch.Tensor  # Float tensor (CPU)
-    original_frames: torch.Tensor  # Uint8 tensor (CPU)
