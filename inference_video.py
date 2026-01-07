@@ -28,13 +28,12 @@ class Envs(BaseSettings):
     num_workers_per_gpu: int = 1
     source: Literal["camera", "video", "rtsp"] = "video"
     enable_monitor: bool = True
-    num_buffer: int = 3
+    num_buffer: int = 10  # Increased buffer size to ensure safety with the locking mechanism
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 envs = Envs()
-
 
 # Setup Logger
 logging.basicConfig(
@@ -77,7 +76,7 @@ class Config:
     RUNTIME_SECONDS: Optional[int] = None
 
     # Buffer
-    NUM_BUFFER: int = 3
+    NUM_BUFFER: int = 10  # Suggest using >= 5 for stability with locking
 
     # Monitor
     ENABLE_MONITOR: bool = True
@@ -115,34 +114,29 @@ class Config:
 
 @dataclass
 class TaskItem:
-    """Data sent from Scheduler to GPU Worker (Lightweight indices)."""
+    """Task payload sent to GPU Worker."""
 
     sids: list[int]
-    buffer_indices: list[int]  # Which buffer (0 or 1) contains the fresh frame
+    buffer_indices: list[int]
     timestamps: list[float]
     dispatch_time: float
 
 
 @dataclass
 class ResultItem:
-    """Data sent from GPU Worker back to Scheduler/Monitor"""
+    """Result payload sent to ResultProcessor."""
 
     sids: list[int]
-    outputs: np.ndarray  # Shape: (B, H, W, 3), dtype=uint8
-    timestamp: float  # time.time()
+    buffer_indices: list[int]  # Needed for ResultProcessor to find original frame in SHM
+    outputs: np.ndarray  # Lightweight density maps (Not blended images)
+    timestamp: float
 
 
 # --- Shared Memory Management ---
 class SharedMemoryManager:
-    """
-    Manages a block of shared memory for zero-copy image transfer between processes.
-    Implements a Double-Buffer strategy to avoid read/write tearing.
-    Structure: [NUM_STREAMS, num_buffers, H, W, 3] (uint8)
-    """
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        # Dimensions: Streams x Buffers x H x W x Channels
+        # Structure: [NUM_STREAMS, NUM_BUFFER, H, W, 3] (uint8)
         self.shape = (cfg.NUM_STREAMS, cfg.NUM_BUFFER, cfg.INPUT_H, cfg.INPUT_W, 3)
         self.dtype = np.uint8
         self.nbytes = int(np.prod(self.shape) * np.dtype(self.dtype).itemsize)
@@ -151,11 +145,9 @@ class SharedMemoryManager:
         self._linked = False
 
     def create(self):
-        """Allocates shared memory."""
         try:
             self.shm = shm.SharedMemory(create=True, size=self.nbytes, name=self.shm_name)
             self._linked = True
-            # Zero out memory
             arr = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm.buf)
             arr[:] = 0
             logger.info(f"Shared Memory allocated: {self.nbytes / 1024 / 1024:.2f} MB")
@@ -165,7 +157,6 @@ class SharedMemoryManager:
             raise
 
     def close(self):
-        """Cleanup."""
         if self.shm:
             self.shm.close()
             if self._linked:
@@ -173,76 +164,148 @@ class SharedMemoryManager:
                 self._linked = False
             logger.info("Shared Memory released.")
 
-    def get_ndarray(self) -> np.ndarray:
-        """Returns the numpy view of the shared memory."""
-        if not self.shm:
-            raise RuntimeError("Shared memory not initialized.")
-        return np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm.buf)
+
+def init_shared_metadata(cfg: Config):
+    """
+    Initialize shared metadata table and cursor.
+    buffer_meta structure: [NUM_STREAMS, NUM_BUFFER, 2] (float64)
+       - [..., 0]: State (0=Free, 1=Locked, 2=Ready)
+       - [..., 1]: Timestamp
+    """
+    # 1. Calculate required size
+    shape = (cfg.NUM_STREAMS, cfg.NUM_BUFFER, 2)
+    dtype = np.float64
+    nbytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
+
+    # 2. Allocate SHM
+    shm_name = f"shm_meta_{time.time()}"
+    shm_obj = shm.SharedMemory(create=True, size=nbytes, name=shm_name)
+
+    # 3. Create view and initialize
+    buffer_meta = np.ndarray(shape, dtype=dtype, buffer=shm_obj.buf)
+    buffer_meta.fill(0)  # Init all as Free
+
+    # 4. Create latest cursor (tracks the last written buffer index for each stream)
+    # Init -1 means no data written yet
+    latest_cursor = mp.Array("i", cfg.NUM_STREAMS)
+    for i in range(cfg.NUM_STREAMS):
+        latest_cursor[i] = -1
+
+    return shm_obj, buffer_meta, latest_cursor
 
 
-# --- 1. Frame Grabber (Thread) ---
+def process_grabber_frame(
+    sid: int,
+    frame: np.ndarray,
+    buffer_meta: np.ndarray,  # [NUM_STREAMS, NUM_BUFFER, 2]
+    latest_cursor: mp.Array,
+    my_buffers: np.ndarray,
+    cfg: Config,
+    now: float,
+):
+    """
+    Core Grabber Logic:
+    1. Determine next buffer index.
+    2. Check lock state (Drop if locked).
+    3. Write data & update metadata.
+    """
+    # CPU Preprocessing
+    frame = cv2.resize(frame, (cfg.INPUT_W, cfg.INPUT_H))
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # 1. Get current cursor position
+    current_idx = latest_cursor[sid]
+
+    if current_idx == -1:
+        next_idx = 0
+    else:
+        next_idx = (current_idx + 1) % cfg.NUM_BUFFER
+
+    # 2. Check Buffer State
+    # 0.0 = Free, 2.0 = Ready (Overwritable), 1.0 = Locked (Protected)
+    state = buffer_meta[sid, next_idx, 0]
+
+    if state == 1.0:
+        # [Flow Control] Target buffer is in use. Drop this frame.
+        logger.debug(f"[Stream {sid}] Buffer {next_idx} Locked. Dropping frame.")
+        return
+
+        # 3. Write Data (Zero Copy)
+    np.copyto(my_buffers[next_idx], frame)
+
+    # 4. Update Metadata
+    # Mark as Ready (2.0)
+    buffer_meta[sid, next_idx, 0] = 2.0
+    buffer_meta[sid, next_idx, 1] = now
+
+    # 5. Update Global Cursor
+    # Using lock ensures Scheduler reads consistent state if it checks concurrently
+    with latest_cursor.get_lock():
+        latest_cursor[sid] = next_idx
+
+
 class FrameGrabber(threading.Thread):
     def __init__(
         self,
         sid: int,
         src: str,
-        shm_name: str,
-        shm_shape: tuple,
-        meta_array: mp.Array,  # Shared array for [timestamp, buffer_idx, new_data_flag]
+        shm_frames_name: str,
+        shm_frames_shape: tuple,
+        shm_meta_name: str,
+        shm_meta_shape: tuple,
+        latest_cursor: mp.Array,
         stop_event: threading.Event,
         cfg: Config,
     ) -> None:
         super().__init__(daemon=True, name=f"grabber-{sid}")
         self.sid = sid
         self.src = src
-        self.shm_name = shm_name
-        self.shm_shape = shm_shape
-        self.meta_array = meta_array  # Access to shared metadata
+        self.shm_frames_name = shm_frames_name
+        self.shm_frames_shape = shm_frames_shape
+        self.shm_meta_name = shm_meta_name
+        self.shm_meta_shape = shm_meta_shape
+        self.latest_cursor = latest_cursor
         self.stop_event = stop_event
         self.cfg = cfg
-
         self._interval = cfg.frame_interval_s
 
     def run(self) -> None:
-        # Attach to existing Shared Memory
+        # 1. Attach Video Frames SHM
         try:
-            existing_shm = shm.SharedMemory(name=self.shm_name)
-            # Create numpy view: [NUM_STREAMS, NUM_BUFFER, H, W, 3]
-            full_array = np.ndarray(self.shm_shape, dtype=np.uint8, buffer=existing_shm.buf)
-            # Slice only my stream: [NUM_BUFFER, H, W, 3]
-            my_buffers = full_array[self.sid]
+            existing_shm_frames = shm.SharedMemory(name=self.shm_frames_name)
+            full_frames = np.ndarray(self.shm_frames_shape, dtype=np.uint8, buffer=existing_shm_frames.buf)
+            my_buffers = full_frames[self.sid]
         except Exception as e:
-            logger.error(f"[Stream {self.sid}] Shared Memory attach failed: {e}")
+            logger.error(f"[Stream {self.sid}] Frames SHM attach failed: {e}")
+            return
+
+        # 2. Attach Metadata SHM
+        try:
+            existing_shm_meta = shm.SharedMemory(name=self.shm_meta_name)
+            buffer_meta = np.ndarray(self.shm_meta_shape, dtype=np.float64, buffer=existing_shm_meta.buf)
+        except Exception as e:
+            logger.error(f"[Stream {self.sid}] Meta SHM attach failed: {e}")
             return
 
         while not self.stop_event.is_set():
-            # Connection Logic
             cap = cv2.VideoCapture(self.src)
             if not cap.isOpened():
                 logger.warning(f"[Stream {self.sid}] Connection failed. Retrying in 5s...")
                 time.sleep(5)
                 continue
 
-            # Optimization: Set backend buffer size to minimal
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
             logger.info(f"[Stream {self.sid}] Connected.")
-
             last_ok_time = time.time()
 
-            # Frame Loop
             while not self.stop_event.is_set():
                 if not cap.grab():
-                    # Timeout check
                     if time.time() - last_ok_time > 5.0:
-                        logger.warning(f"[Stream {self.sid}] No frames for 5s (Timeout). Reconnecting...")
+                        logger.warning(f"[Stream {self.sid}] Timeout. Reconnecting...")
                         break
-                    # Timeout check could be added here
                     time.sleep(0.01)
                     continue
 
-                # Throttle check (if reading from file/fast source)
-                # For RTSP, the network dictates speed, but this helps alignment
                 last_ok_time = time.time()
                 next_slot = int(last_ok_time / self._interval) + 1
                 target_ts = next_slot * self._interval
@@ -252,75 +315,190 @@ class FrameGrabber(threading.Thread):
                     break
 
                 try:
-                    # CPU Preprocessing
-                    frame = cv2.resize(frame, (self.cfg.INPUT_W, self.cfg.INPUT_H))  # w, h
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    process_grabber_frame(
+                        self.sid, frame, buffer_meta, self.latest_cursor, my_buffers, self.cfg, time.time()
+                    )
 
-                    # Determine write buffer (toggle between 0 and 1)
-                    # meta_array structure per stream: [timestamp, current_buffer_idx, is_dirty]
-                    # We read current, write to next (1 - current)
-                    # Actually, since we are single writer, we can just toggle locally
-
-                    # Read current state
-                    with self.meta_array.get_lock():
-                        # index 0: timestamp, index 1: buffer_idx, index 2: is_dirty
-                        current_buf_idx = int(self.meta_array[1])
-                        next_buf_idx = (current_buf_idx + 1) % self.cfg.NUM_BUFFER
-
-                    # Write to Shared Memory (Zero Copy to other processes)
-                    np.copyto(my_buffers[next_buf_idx], frame)
-
-                    # Wait for target time (Alignment)
                     wait = target_ts - time.time()
                     if wait > 0:
                         time.sleep(wait)
-
-                    now = time.time()
-                    # logger.debug(f"[Stream {self.sid}] Frame grabbed @ {now:.3f}s.")
-
-                    # Update Metadata atomically
-                    with self.meta_array.get_lock():
-                        self.meta_array[0] = now  # Timestamp
-                        self.meta_array[1] = next_buf_idx  # New valid buffer
-                        self.meta_array[2] = 1.0  # Set Dirty Flag (New Data Available)
 
                 except Exception as e:
                     logger.error(f"[Stream {self.sid}] Process error: {e}")
                     break
 
             cap.release()
-            existing_shm.close()  # Close handle for this thread (not unlink)
+            existing_shm_frames.close()
+            existing_shm_meta.close()
 
 
 class ResultProcessor(mp.Process):
-    def __init__(self, result_queue, stop_event, handlers: list, cfg: Config):
+    """
+    Processes results from Workers.
+    Optimized: Reads original frames from Shared Memory (Zero-Copy) instead of receiving them via Queue.
+    Responsible for Unlocking Buffers after processing.
+    """
+
+    def __init__(
+        self,
+        result_queue,
+        stop_event,
+        handlers: list,
+        cfg: Config,
+        shm_frames_name: str,
+        shm_frames_shape: tuple,
+        shm_meta_name: str,
+        shm_meta_shape: tuple,
+    ):
         super().__init__(name="Result-Processor", daemon=True)
         self.result_queue = result_queue
         self.stop_event = stop_event
         self.handlers = handlers
         self.cfg = cfg
+        self.shm_frames_name = shm_frames_name
+        self.shm_frames_shape = shm_frames_shape
+        self.shm_meta_name = shm_meta_name
+        self.shm_meta_shape = shm_meta_shape
 
     def run(self):
+        # 1. Attach Shared Memories
+        try:
+            shm_frames = shm.SharedMemory(name=self.shm_frames_name)
+            full_frames = np.ndarray(self.shm_frames_shape, dtype=np.uint8, buffer=shm_frames.buf)
+
+            shm_meta = shm.SharedMemory(name=self.shm_meta_name)
+            buffer_meta = np.ndarray(self.shm_meta_shape, dtype=np.float64, buffer=shm_meta.buf)
+        except Exception as e:
+            logger.error(f"[ResultProcessor] SHM Attach Failed: {e}")
+            return
+
         for h in self.handlers:
             h.setup()
 
         logger.info("[Post-Processor] Started.")
 
+        # Visualization Constants
+        alpha, beta, threshold = 0.5, 0.5, 0.01
+
         while not self.stop_event.is_set():
             try:
                 item = self.result_queue.get(timeout=0.005)
-                for h in self.handlers:
-                    h.handle(item.sids, item.outputs, item.timestamp)
             except queue.Empty:
                 continue
+
+            try:
+                # 2. Extract Data
+                # item.outputs is the density map (B, 1, H, W) or similar
+                # We need to perform visualization here to offload the GPU Worker
+
+                final_vis_batch = []
+
+                # Zero-Copy Read from Shared Memory
+                # We use advanced indexing to get the batch of original frames
+                batch_orig_frames = full_frames[item.sids, item.buffer_indices]
+
+                for i in range(len(item.sids)):
+                    sid = item.sids[i]
+                    buf_idx = item.buffer_indices[i]
+
+                    if self.cfg.ENABLE_MONITOR:
+                        # Visualization Logic
+                        vis_map = item.outputs[i, 0]  # Assuming (B, 1, H, W) layout
+                        orig_img = batch_orig_frames[i]
+
+                        norm_map = (vis_map - vis_map.min()) / (vis_map.max() - vis_map.min() + 1e-5)
+                        norm_map = cv2.resize(norm_map, (orig_img.shape[1], orig_img.shape[0]))
+                        mask = norm_map > threshold
+
+                        overlay = orig_img.copy()
+                        if mask.any():
+                            dm_color = cv2.applyColorMap((norm_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                            dm_color = cv2.cvtColor(dm_color, cv2.COLOR_BGR2RGB)
+
+                            blended = cv2.addWeighted(orig_img[mask], alpha, dm_color[mask], beta, 0)
+                            overlay[mask] = blended
+
+                        final_vis_batch.append(overlay)
+
+                    # --- CRITICAL: UNLOCK BUFFER ---
+                    # Mark buffer as Free (0.0) so Grabber can reuse it
+                    buffer_meta[sid, buf_idx, 0] = 0.0
+
+                if self.cfg.ENABLE_MONITOR and final_vis_batch:
+                    # Stack list to numpy array for the handler
+                    vis_np = np.stack(final_vis_batch)
+                    for h in self.handlers:
+                        h.handle(item.sids, vis_np, item.timestamp)
+
             except Exception as e:
                 logger.error(f"Result Processor Error: {e}")
+                import traceback
+
+                traceback.print_exc()
 
         for h in self.handlers:
             h.cleanup()
 
+        shm_frames.close()
+        shm_meta.close()
 
-# --- 2. Inference Worker Process ---
+
+def worker_init_model(gpu_id: int, cfg: Config):
+    """Worker Step 1: Initialize device and model."""
+    device = torch.device(f"cuda:{gpu_id}")
+    torch.cuda.set_device(device)
+    torch.backends.cudnn.benchmark = True
+
+    model = ShuffleNetV2_x1_0()
+    st = torch.load(cfg.MODEL_PATH, map_location=device)
+    model.load_state_dict(st)
+    model.to(device).eval()
+
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    return device, model, mean, std
+
+
+def worker_warmup(device: torch.device, model: torch.nn.Module, mean, std, cfg: Config):
+    """Worker Step 2: Warmup execution with correct memory layout."""
+    with torch.inference_mode():
+        with torch.amp.autocast("cuda"):
+            for bsz in range(1, cfg.NUM_STREAMS + 1):
+                # Mimic actual input: (B, H, W, 3) -> Permute -> Float
+                dummy = torch.zeros((bsz, cfg.INPUT_H, cfg.INPUT_W, 3), dtype=torch.uint8, device=device)
+                input_tensor = dummy.permute(0, 3, 1, 2).float().div(255.0)
+                input_tensor = (input_tensor - mean) / std
+                _ = model(input_tensor)
+            torch.cuda.synchronize()
+
+
+def worker_execute_batch(
+    task: TaskItem, shm_array: np.ndarray, device: torch.device, model: torch.nn.Module, mean, std
+) -> tuple[torch.Tensor, float, float, float]:
+    """Worker Step 3: Core Inference Logic (Data Prep -> Infer)."""
+    t0 = time.perf_counter()
+
+    # 1. Load Data (Zero Copy from SHM)
+    batch_frames_np = shm_array[task.sids, task.buffer_indices]
+    input_tensor = torch.from_numpy(batch_frames_np).to(device, non_blocking=True)
+
+    # 2. Preprocess
+    input_tensor = input_tensor.permute(0, 3, 1, 2).float().div(255.0)
+    input_tensor = (input_tensor - mean) / std
+    t1 = time.perf_counter()
+
+    # 3. Infer
+    with torch.inference_mode():
+        with torch.amp.autocast("cuda"):
+            outputs, _ = model(input_tensor)
+
+    torch.cuda.synchronize()
+    t2 = time.perf_counter()
+
+    return outputs, t0, t1, t2
+
+
 def inference_worker(
     worker_id: int,
     gpu_id: int,
@@ -330,47 +508,20 @@ def inference_worker(
     shm_name: str,
     shm_shape: tuple,
     shutdown: "mp.Event",
-    worker_ready: "mp.Array",  # [NEW] Ready Signal
+    worker_ready: "mp.Array",
 ) -> None:
-    """
-    GPU Worker. Reads directly from Shared Memory based on indices received.
-    """
     try:
-        # 1. Setup GPU
-        device = torch.device(f"cuda:{gpu_id}")
-        torch.cuda.set_device(device)
-        torch.backends.cudnn.benchmark = True
+        # 1. Init
+        device, model, mean, std = worker_init_model(gpu_id, cfg)
 
-        # 2. Attach Shared Memory
+        # 2. Attach SHM
         existing_shm = shm.SharedMemory(name=shm_name)
-        # Full view: [NUM_STREAMS, NUM_BUFFER, H, W, 3]
         shm_array = np.ndarray(shm_shape, dtype=np.uint8, buffer=existing_shm.buf)
 
-        # 3. Load Model
-        model = ShuffleNetV2_x1_0()
-        st = torch.load(cfg.MODEL_PATH, map_location=device)
-        model.load_state_dict(st)
-        model.to(device).eval()
-
-        # 4. Pre-allocate GPU constants
-        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-        # 5. Warmup
-        with torch.inference_mode():
-            with torch.amp.autocast("cuda"):
-                for bsz in range(1, cfg.NUM_STREAMS + 1):
-                    dummy = torch.zeros((bsz, cfg.INPUT_H, cfg.INPUT_W, 3), dtype=torch.uint8, device=device)
-                    dummy = dummy.permute(0, 3, 1, 2).float().div(255.0)
-                    dummy = (dummy - mean) / std
-                    _ = model(dummy)
-                torch.cuda.synchronize()
-
-        # 6 Other params
-        alpha, beta, threshold = 0.5, 0.5, 0.01
+        # 3. Warmup
+        worker_warmup(device, model, mean, std, cfg)
 
         logger.info(f"[Worker {worker_id}] Initialized on GPU {gpu_id}. Signalling READY.")
-
         with worker_ready.get_lock():
             worker_ready[worker_id] = 1
 
@@ -380,109 +531,41 @@ def inference_worker(
 
     while not shutdown.is_set():
         try:
-            task = task_queue.get(timeout=0.01)
+            task = task_queue.get(timeout=0.005)
         except queue.Empty:
             continue
 
         try:
-            # --- Efficient Data Loading ---
-            # Extract specific buffers for this batch.
-            # Note: numpy indexing with lists copies data, but this copy is unavoidable
-            # to form a contiguous batch. It is fast in memory.
-            # shm_array[sid, buf_idx]
-            t0 = time.perf_counter()
-            wall_now = time.time()
+            # 4. Infer
+            outputs, t0, t1, t2 = worker_execute_batch(task, shm_array, device, model, mean, std)
 
+            # 5. Send Result (Lightweight)
+            # Send CPU numpy array of density map. No visualization here!
+            outputs_cpu = outputs.detach().float().cpu().numpy()
+
+            result_queue.put(
+                ResultItem(
+                    sids=task.sids,
+                    buffer_indices=task.buffer_indices,  # Pass indices so ResultProcessor can find frames
+                    outputs=outputs_cpu,
+                    timestamp=time.time(),
+                )
+            )
+
+            # 6. Log
+            t3 = time.perf_counter()
+            wall_now = time.time()
             queue_wait_ms = (wall_now - task.dispatch_time) * 1000
             avg_frame_age_ms = sum([(wall_now - ts) for ts in task.timestamps]) / len(task.timestamps) * 1000
 
-            # Advanced Slicing: shm_array[task.sids, task.buffer_indices]
-            # selects the correct buffer for each stream in the batch
-            batch_frames_np = shm_array[task.sids, task.buffer_indices]
-
-            # Convert to Tensor (Pin Memory behavior is automatic if passing from CPU tensor usually,
-            # but here we go direct. For max speed, we could use a pinned CPU buffer,
-            # but let's keep it simple and robust).
-            input_tensor = torch.from_numpy(batch_frames_np).to(device, non_blocking=True)
-
-            # Preprocessing on GPU
-            input_tensor = input_tensor.permute(0, 3, 1, 2).float().div(255.0)
-            input_tensor = (input_tensor - mean) / std
-
-            t1 = time.perf_counter()  # Data Prep Done
-
-            # Inference
-            with torch.inference_mode():
-                with torch.amp.autocast("cuda"):
-                    outputs, _ = model(input_tensor)
-
-            torch.cuda.synchronize()
-            t2 = time.perf_counter()  # Inference Done
-
-            # --- Post Processing (Visualization) ---
-            # Moving back to CPU for OpenCV ops (since cv2 functions run on CPU)
-            # If strictly optimizing, visualization should happen in a separate process
-            # or purely via GPU shaders, but here we follow original logic.
-
-            outputs_cpu = outputs.detach().float().cpu().numpy()
-
-            # We need the original images for blending. They are in batch_frames_np
-            # Visualization logic mirrored from original
-            batch_vis = []
-
-            for i in range(len(task.sids)):
-                vis_map = outputs_cpu[i, 0]
-                orig_img = batch_frames_np[i]  # RGB
-
-                # Normalize density map
-                norm_map = (vis_map - vis_map.min()) / (vis_map.max() - vis_map.min() + 1e-5)
-                norm_map = cv2.resize(norm_map, (orig_img.shape[1], orig_img.shape[0]))
-
-                mask = norm_map > threshold
-
-                # We need BGR for OpenCV saving/display usually, but Handler might expect RGB.
-                # Assuming Handler expects RGB based on original code flow.
-                overlay = orig_img.copy()
-
-                if mask.any():
-                    dm_color = cv2.applyColorMap((norm_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
-                    # applyColorMap returns BGR, we need RGB if orig is RGB
-                    dm_color = cv2.cvtColor(dm_color, cv2.COLOR_BGR2RGB)
-
-                    roi_orig = orig_img[mask]
-                    roi_heat = dm_color[mask]
-                    blended = cv2.addWeighted(roi_orig, alpha, roi_heat, beta, 0)
-                    overlay[mask] = blended
-
-                batch_vis.append(overlay)
-
-            t3 = time.perf_counter()  # Post-proc Done
-
-            # Send result
-            final_output = np.stack(batch_vis)
-            # We send numpy array instead of Tensor to avoid pickling CUDA tensors to CPU queues
-            result_queue.put(ResultItem(task.sids, final_output, time.time()))
-
-            # --- Log Analysis ---
-            # Data Prep Time
-            t_data_ms = (t1 - t0) * 1000
-            # GPU Inference Time
-            t_infer_ms = (t2 - t1) * 1000
-            # CPU Post-Process Time
-            t_post_ms = (t3 - t2) * 1000
-            # Total Step Time
-            t_total_ms = (t3 - t0) * 1000
-
-            # Format nicely
             log_msg = (
                 f"[Worker {worker_id}] Batch={len(task.sids)} | "
                 f"BufIdx={task.buffer_indices} | "
                 f"FrameAge={avg_frame_age_ms:.1f}ms | "
                 f"Q-Wait={queue_wait_ms:.1f}ms | "
-                f"DataPrep={t_data_ms:.1f}ms | "
-                f"GPU-Infer={t_infer_ms:.1f}ms | "
-                f"PostProc={t_post_ms:.1f}ms | "
-                f"TOTAL={t_total_ms:.1f}ms"
+                f"DataPrep={(t1 - t0) * 1000:.1f}ms | "
+                f"Infer={(t2 - t1) * 1000:.1f}ms | "
+                f"Total={(t3 - t0) * 1000:.1f}ms"
             )
             logger.debug(log_msg)
 
@@ -496,69 +579,14 @@ def inference_worker(
     logger.info(f"[Worker {worker_id}] Shutdown.")
 
 
-# --- 4. Main Engine / Scheduler ---
-def run_scheduler(cfg: Config):
-    """
-    Central Controller.
-    1. Manages Shared Memory.
-    2. Spawns Workers & Grabbers.
-    3. Dispatches Tasks based on stream status.
-    """
-    # Signal handling for clean cleanup
-    shutdown_event = mp.Event()
-
-    def signal_handler(sig, frame):
-        logger.info("Signal received, shutting down...")
-        shutdown_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # 1. Initialize Shared Memory Manager
-    shm_mgr = SharedMemoryManager(cfg)
-    shm_name = shm_mgr.create()
-
-    # 2. Shared Metadata Arrays
-    # Format per stream: [timestamp (double), buffer_idx (double), is_dirty (double)]
-    # Using 'd' (double) for all to keep simple array structure
-    # is_dirty: 1.0 means new frame ready, 0.0 means processed
-    meta_arrays = [mp.Array("d", 3) for _ in range(cfg.NUM_STREAMS)]
-
-    # 3. Setup Workers Variables
-    ctx = mp.get_context("spawn")
+def spawn_workers(
+    ctx, cfg: Config, shm_name: str, shm_shape: tuple, shutdown_event
+) -> tuple[list, list, mp.Queue, mp.Array]:
+    """Create and start worker processes."""
     total_workers = len(cfg.AVAILABLE_GPUS) * cfg.NUM_WORKERS_PER_GPU
-    task_queues = [ctx.Queue(maxsize=2) for _ in range(total_workers)]  # Small buffer to prevent latency
+    task_queues = [ctx.Queue(maxsize=2) for _ in range(total_workers)]
     result_queue = ctx.Queue(maxsize=total_workers * 2)
-
-    # 4. Start Grabbers
-    grabber_stop = threading.Event()
-    grabbers = []
-    for i, src in enumerate(cfg.stream_sources):
-        t = FrameGrabber(
-            sid=i,
-            src=src,
-            shm_name=shm_name,
-            shm_shape=shm_mgr.shape,
-            meta_array=meta_arrays[i],
-            stop_event=grabber_stop,
-            cfg=cfg,
-        )
-        t.start()
-        grabbers.append(t)
-
-    # 5. Start Result Processor
-    handlers = [VisualizationHandler(cfg)]
-    res_proc = ResultProcessor(result_queue, shutdown_event, handlers, cfg)
-    res_proc.start()
-
-    time.sleep(5)
-
-    # 6. Start Workers
-    logger.info(f"Spawning {total_workers} GPU workers...")
-
     worker_ready = mp.Array("i", total_workers)
-    for i in range(total_workers):
-        worker_ready[i] = 0
 
     workers = []
     w_idx = 0
@@ -573,7 +601,7 @@ def run_scheduler(cfg: Config):
                     task_queues[w_idx],
                     result_queue,
                     shm_name,
-                    shm_mgr.shape,
+                    shm_shape,
                     shutdown_event,
                     worker_ready,
                 ),
@@ -584,9 +612,39 @@ def run_scheduler(cfg: Config):
             workers.append(p)
             w_idx += 1
 
-    # 7. [KEY FIX] Startup Barrier
-    # Wait until ALL workers signal they are initialized.
-    # This prevents the Scheduler from filling queues before consumers are ready.
+    return workers, task_queues, result_queue, worker_ready
+
+
+def spawn_grabbers(
+    cfg: Config,
+    shm_frames_name: str,
+    shm_frames_shape: tuple,
+    shm_meta_name: str,
+    shm_meta_shape: tuple,
+    latest_cursor: mp.Array,
+) -> tuple[list, threading.Event]:
+    stop_event = threading.Event()
+    grabbers = []
+
+    for i, src in enumerate(cfg.stream_sources):
+        t = FrameGrabber(
+            sid=i,
+            src=src,
+            shm_frames_name=shm_frames_name,
+            shm_frames_shape=shm_frames_shape,
+            shm_meta_name=shm_meta_name,
+            shm_meta_shape=shm_meta_shape,
+            latest_cursor=latest_cursor,
+            stop_event=stop_event,
+            cfg=cfg,
+        )
+        t.start()
+        grabbers.append(t)
+    return grabbers, stop_event
+
+
+def wait_for_startup_barrier(worker_ready: mp.Array, total_workers: int, shutdown_event: mp.Event, shm_mgr):
+    """Wait for all workers to signal readiness."""
     logger.info("Waiting for workers to initialize (load models)...")
     try:
         while not shutdown_event.is_set():
@@ -597,88 +655,149 @@ def run_scheduler(cfg: Config):
             if ready_count == total_workers:
                 logger.info("All Workers READY. Starting Pipeline.")
                 break
-
             time.sleep(0.5)
     except KeyboardInterrupt:
         shutdown_event.set()
         shm_mgr.close()
+        raise
+
+
+def scheduler_dispatch_loop(
+    cfg: Config,
+    buffer_meta: np.ndarray,
+    latest_cursor: mp.Array,
+    task_queues: list,
+    shutdown_event: mp.Event,
+    total_workers: int,
+):
+    """
+    Main Scheduler Loop:
+    1. Scan `latest_cursor` for new frames.
+    2. Check `buffer_meta` if frame is Ready (2.0).
+    3. Lock (1.0) and Dispatch.
+    """
+    start_time = time.time()
+
+    while not shutdown_event.is_set():
+        loop_start = time.time()
+        next_slot = int(loop_start / cfg.frame_interval_s) + 1
+        target_ts = next_slot * cfg.frame_interval_s
+
+        if cfg.RUNTIME_SECONDS and (loop_start - start_time > cfg.RUNTIME_SECONDS):
+            logger.info("Runtime limit reached.")
+            break
+
+        # 1. Accumulate Tasks
+        pending_tasks = [[] for _ in range(total_workers)]
+
+        for sid in range(cfg.NUM_STREAMS):
+            idx = latest_cursor[sid]
+
+            if idx == -1:
+                continue
+
+            # Check State: Is it Ready (2.0)?
+            if buffer_meta[sid, idx, 0] > 1.5:
+                # [LOCK] Mark as Locked (1.0) immediately
+                buffer_meta[sid, idx, 0] = 1.0
+
+                ts = buffer_meta[sid, idx, 1]
+
+                # Round Robin Dispatch
+                w_target = sid % total_workers
+                pending_tasks[w_target].append((sid, idx, ts))
+
+        # 2. Dispatch
+        for w_id in range(total_workers):
+            batch = pending_tasks[w_id]
+            if not batch:
+                continue
+
+            try:
+                task_queues[w_id].put_nowait(
+                    TaskItem(
+                        sids=[b[0] for b in batch],
+                        buffer_indices=[b[1] for b in batch],
+                        timestamps=[b[2] for b in batch],
+                        dispatch_time=time.time(),
+                    )
+                )
+            except queue.Full:
+                # Rollback: Since we can't process it, release lock?
+                # Actually, dropping is safer to avoid backlog.
+                # Mark as Free (0.0) effectively dropping the frame logic
+                logger.debug(f"[Worker {w_id}] Task queue full. Dropping batch of {len(batch)} frames.")
+                for sid, idx, _ in batch:
+                    buffer_meta[sid, idx, 0] = 0.0
+                pass
+
+        # 3. Wait for FPS Alignment. This is import to ensure we gather enough data for inference.
+        wait = target_ts - time.time()
+        if wait > 0:
+            time.sleep(wait)
+
+
+def run_scheduler(cfg: Config):
+    shutdown_event = mp.Event()
+
+    def signal_handler(sig, frame):
+        logger.info("Signal received, shutting down...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # 1. Init Frames Memory
+    shm_mgr_frames = SharedMemoryManager(cfg)
+    shm_frames_name = shm_mgr_frames.create()
+
+    # 2. Init Metadata Memory
+    shm_obj_meta, buffer_meta, latest_cursor = init_shared_metadata(cfg)
+    shm_meta_name = shm_obj_meta.name
+
+    # 3. Start Grabbers
+    grabbers, grabber_stop = spawn_grabbers(
+        cfg, shm_frames_name, shm_mgr_frames.shape, shm_meta_name, buffer_meta.shape, latest_cursor
+    )
+
+    # 4. Spawn Workers
+    ctx = mp.get_context("spawn")
+    workers, task_queues, result_queue, worker_ready = spawn_workers(
+        ctx, cfg, shm_frames_name, shm_mgr_frames.shape, shutdown_event
+    )
+
+    # 5. Start Result Processor
+    # Pass SHM info to RP so it can attach and read original frames
+    handlers = [VisualizationHandler(cfg)]
+    res_proc = ResultProcessor(
+        result_queue,
+        shutdown_event,
+        handlers,
+        cfg,
+        shm_frames_name,
+        shm_mgr_frames.shape,
+        shm_meta_name,
+        buffer_meta.shape,
+    )
+    res_proc.start()
+
+    # 6. Wait for Workers Ready
+    try:
+        wait_for_startup_barrier(worker_ready, len(workers), shutdown_event, shm_mgr_frames)
+    except KeyboardInterrupt:
         return
 
     logger.info("Scheduler loop starting...")
 
-    # --- Main Loop ---
-    start_time = time.time()
-
     try:
-        while not shutdown_event.is_set():
-            loop_start = time.time()
-            next_slot = int(loop_start / cfg.frame_interval_s) + 1
-            target_ts = next_slot * cfg.frame_interval_s
-
-            if cfg.RUNTIME_SECONDS and (loop_start - start_time > cfg.RUNTIME_SECONDS):
-                logger.info("Runtime limit reached.")
-                break
-
-            # A. Identify Streams with New Data
-            # We iterate metadata. Accessing mp.Array is faster than queue.
-            # Strategy: Round Robin dispatch
-
-            # Group streams by which worker they belong to (Static Load Balancing)
-            # or Dynamic. Let's do Dynamic accumulation.
-
-            pending_tasks = [[] for _ in range(total_workers)]
-
-            for sid in range(cfg.NUM_STREAMS):
-                ma = meta_arrays[sid]
-                # Non-blocking check first
-                if ma[2] > 0.5:  # is_dirty == 1.0
-                    with ma.get_lock():
-                        if ma[2] > 0.5:
-                            # Capture state
-                            ts = ma[0]
-                            buf_idx = int(ma[1])
-                            # Clear dirty flag immediately so Grabber knows it's consumed
-                            # (Though Grabber doesn't really check this, it just overwrites next buffer)
-                            ma[2] = 0.0
-
-                            # Assign to worker (Round Robin based on SID)
-                            w_target = sid % total_workers
-                            pending_tasks[w_target].append((sid, buf_idx, ts))
-
-            # B. Dispatch Batches
-            for w_id in range(total_workers):
-                batch = pending_tasks[w_id]
-                if not batch:
-                    continue
-
-                # Unpack batch
-                sids = [b[0] for b in batch]
-                buf_idxs = [b[1] for b in batch]
-                timestamps = [b[2] for b in batch]
-
-                try:
-                    task_queues[w_id].put_nowait(
-                        TaskItem(
-                            sids=sids,
-                            buffer_indices=buf_idxs,
-                            timestamps=timestamps,
-                            dispatch_time=time.time(),
-                        )
-                    )
-                except queue.Full:
-                    # Drop frame if worker is overwhelmed (Latency > Throughput)
-                    logger.debug(f"[Worker {w_id}] Task Queue Full.")
-                    pass
-
-            # C. Rate Limit / Idle Wait
-            wait = target_ts - time.time()
-            if wait > 0:
-                time.sleep(wait)
-
+        scheduler_dispatch_loop(cfg, buffer_meta, latest_cursor, task_queues, shutdown_event, len(workers))
     except KeyboardInterrupt:
         logger.info("Interrupted.")
     except Exception as e:
         logger.error(f"Scheduler Fatal Error: {e}")
+        import traceback
+
+        traceback.print_exc()
     finally:
         logger.info("Stopping components...")
         shutdown_event.set()
@@ -686,34 +805,32 @@ def run_scheduler(cfg: Config):
 
         for t in grabbers:
             t.join(timeout=1.0)
-
         for p in workers:
             p.terminate()
-
         res_proc.terminate()
 
-        # Vital: Cleanup Shared Memory
-        shm_mgr.close()
+        # Cleanup SHM
+        shm_mgr_frames.close()
+
+        # Cleanup Meta SHM
+        shm_obj_meta.close()
+        shm_obj_meta.unlink()
+
         logger.info("System Shutdown Complete.")
 
 
 def main():
-    # Use config from envs
     gpus = tuple(int(x) for x in envs.cuda_visible_devices.split(",") if x.strip() != "")
-
     cfg = Config(
         TARGET_FPS=envs.fps,
         NUM_STREAMS=envs.num_streams,
         AVAILABLE_GPUS=gpus if gpus else (0,),
         NUM_WORKERS_PER_GPU=envs.num_workers_per_gpu,
         NUM_BUFFER=envs.num_buffer,
-        SOURCE=envs.source,  # type: ignore
+        SOURCE=envs.source,
         ENABLE_MONITOR=envs.enable_monitor,
     )
-
-    # Required for Shared Memory & CUDA in subprocesses
     mp.set_start_method("spawn", force=True)
-
     run_scheduler(cfg)
 
 
