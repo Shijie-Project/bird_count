@@ -308,7 +308,7 @@ class ResultProcessor(mp.Process):
 
         while not self.stop_event.is_set():
             try:
-                item = self.result_queue.get(timeout=0.01)
+                item = self.result_queue.get(timeout=0.005)
                 for h in self.handlers:
                     h.handle(item.sids, item.outputs, item.timestamp)
             except queue.Empty:
@@ -352,17 +352,19 @@ def inference_worker(
         model.load_state_dict(st)
         model.to(device).eval()
 
-        # 4. Warmup
+        # 4. Pre-allocate GPU constants
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+        # 5. Warmup
         with torch.inference_mode():
             with torch.amp.autocast("cuda"):
                 for bsz in range(1, cfg.NUM_STREAMS + 1):
-                    dummy = torch.zeros((bsz, 3, cfg.INPUT_H, cfg.INPUT_W), device=device)
+                    dummy = torch.zeros((bsz, cfg.INPUT_H, cfg.INPUT_W, 3), dtype=torch.uint8, device=device)
+                    dummy = dummy.permute(0, 3, 1, 2).float().div(255.0)
+                    dummy = (dummy - mean) / std
                     _ = model(dummy)
                 torch.cuda.synchronize()
-
-        # 5. Pre-allocate GPU constants
-        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
         # 6 Other params
         alpha, beta, threshold = 0.5, 0.5, 0.01
