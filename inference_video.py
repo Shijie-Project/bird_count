@@ -207,9 +207,9 @@ class FrameGrabber(threading.Thread):
         # Attach to existing Shared Memory
         try:
             existing_shm = shm.SharedMemory(name=self.shm_name)
-            # Create numpy view: [NUM_STREAMS, 2, H, W, 3]
+            # Create numpy view: [NUM_STREAMS, NUM_BUFFER, H, W, 3]
             full_array = np.ndarray(self.shm_shape, dtype=np.uint8, buffer=existing_shm.buf)
-            # Slice only my stream: [2, H, W, 3]
+            # Slice only my stream: [NUM_BUFFER, H, W, 3]
             my_buffers = full_array[self.sid]
         except Exception as e:
             logger.error(f"[Stream {self.sid}] Shared Memory attach failed: {e}")
@@ -330,42 +330,51 @@ def inference_worker(
     shm_name: str,
     shm_shape: tuple,
     shutdown: "mp.Event",
+    worker_ready: "mp.Array",  # [NEW] Ready Signal
 ) -> None:
     """
     GPU Worker. Reads directly from Shared Memory based on indices received.
     """
-    # 1. Setup GPU
-    device = torch.device(f"cuda:{gpu_id}")
-    torch.cuda.set_device(device)
-    torch.backends.cudnn.benchmark = True
-
-    # 2. Attach Shared Memory
     try:
+        # 1. Setup GPU
+        device = torch.device(f"cuda:{gpu_id}")
+        torch.cuda.set_device(device)
+        torch.backends.cudnn.benchmark = True
+
+        # 2. Attach Shared Memory
         existing_shm = shm.SharedMemory(name=shm_name)
-        # Full view: [NUM_STREAMS, 2, H, W, 3]
+        # Full view: [NUM_STREAMS, NUM_BUFFER, H, W, 3]
         shm_array = np.ndarray(shm_shape, dtype=np.uint8, buffer=existing_shm.buf)
-    except Exception as e:
-        logger.error(f"[Worker {worker_id}] SHM Error: {e}")
-        return
 
-    # 3. Load Model
-    model = ShuffleNetV2_x1_0()
-    try:
+        # 3. Load Model
+        model = ShuffleNetV2_x1_0()
         st = torch.load(cfg.MODEL_PATH, map_location=device)
         model.load_state_dict(st)
         model.to(device).eval()
+
+        # 4. Warmup
+        with torch.inference_mode():
+            with torch.amp.autocast("cuda"):
+                for bsz in range(1, cfg.NUM_STREAMS + 1):
+                    dummy = torch.zeros((bsz, 3, cfg.INPUT_H, cfg.INPUT_W), device=device)
+                    _ = model(dummy)
+                torch.cuda.synchronize()
+
+        # 5. Pre-allocate GPU constants
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+        # 6 Other params
+        alpha, beta, threshold = 0.5, 0.5, 0.01
+
+        logger.info(f"[Worker {worker_id}] Initialized on GPU {gpu_id}. Signalling READY.")
+
+        with worker_ready.get_lock():
+            worker_ready[worker_id] = 1
+
     except Exception as e:
-        logger.error(f"[Worker {worker_id}] Model Load Failed: {e}")
+        logger.error(f"[Worker {worker_id}] Init Fatal Error: {e}")
         return
-
-    # 4. Pre-allocate GPU constants
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-    # Visualization params
-    alpha, beta, threshold = 0.5, 0.5, 0.01
-
-    logger.info(f"[Worker {worker_id}] Ready on GPU {gpu_id}.")
 
     while not shutdown.is_set():
         try:
@@ -519,12 +528,36 @@ def run_scheduler(cfg: Config):
     task_queues = [ctx.Queue(maxsize=2) for _ in range(total_workers)]  # Small buffer to prevent latency
     result_queue = ctx.Queue(maxsize=total_workers * 2)
 
+    # 4. Start Grabbers
+    grabber_stop = threading.Event()
+    grabbers = []
+    for i, src in enumerate(cfg.stream_sources):
+        t = FrameGrabber(
+            sid=i,
+            src=src,
+            shm_name=shm_name,
+            shm_shape=shm_mgr.shape,
+            meta_array=meta_arrays[i],
+            stop_event=grabber_stop,
+            cfg=cfg,
+        )
+        t.start()
+        grabbers.append(t)
+
+    # 5. Start Result Processor
+    handlers = [VisualizationHandler(cfg)]
+    res_proc = ResultProcessor(result_queue, shutdown_event, handlers, cfg)
+    res_proc.start()
+
+    time.sleep(5)
+
+    # 6. Start Workers
+    logger.info(f"Spawning {total_workers} GPU workers...")
+
     worker_ready = mp.Array("i", total_workers)
     for i in range(total_workers):
         worker_ready[i] = 0
 
-    # 4. Start Workers FIRST
-    logger.info(f"Spawning {total_workers} GPU workers...")
     workers = []
     w_idx = 0
     for gpu in cfg.AVAILABLE_GPUS:
@@ -549,7 +582,7 @@ def run_scheduler(cfg: Config):
             workers.append(p)
             w_idx += 1
 
-    # 5. [KEY FIX] Startup Barrier
+    # 7. [KEY FIX] Startup Barrier
     # Wait until ALL workers signal they are initialized.
     # This prevents the Scheduler from filling queues before consumers are ready.
     logger.info("Waiting for workers to initialize (load models)...")
@@ -568,27 +601,6 @@ def run_scheduler(cfg: Config):
         shutdown_event.set()
         shm_mgr.close()
         return
-
-    # 6. Start Result Processor
-    handlers = [VisualizationHandler(cfg)]
-    res_proc = ResultProcessor(result_queue, shutdown_event, handlers, cfg)
-    res_proc.start()
-
-    # 7. Start Grabbers (Now it's safe to start producing data)
-    grabber_stop = threading.Event()
-    grabbers = []
-    for i, src in enumerate(cfg.stream_sources):
-        t = FrameGrabber(
-            sid=i,
-            src=src,
-            shm_name=shm_name,
-            shm_shape=shm_mgr.shape,
-            meta_array=meta_arrays[i],
-            stop_event=grabber_stop,
-            cfg=cfg,
-        )
-        t.start()
-        grabbers.append(t)
 
     logger.info("Scheduler loop starting...")
 
