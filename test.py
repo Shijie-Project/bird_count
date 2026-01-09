@@ -16,8 +16,9 @@ warnings.simplefilter("ignore", UserWarning)
 def get_args():
     parser = argparse.ArgumentParser(description="Test")
     parser.add_argument("--device", default="0", help="assign device")
-    parser.add_argument("--model", default="vgg", choices=["vgg", "shufflenet"], help="model name")
-    parser.add_argument("--checkpoint", type=str, default="./ckpts/vgg_model_best.pth", help="saved model path")
+    parser.add_argument("--split", default="val", choices=["val", "train"], help="split dataset")
+    parser.add_argument("--model", default="shufflenet", choices=["vgg", "shufflenet"], help="model name")
+    parser.add_argument("--checkpoint", type=str, default="./ckpts/shufflenet_model_best.pth", help="saved model path")
     parser.add_argument("--data-path", type=str, default="./data/bird_count/", help="saved model path")
     parser.add_argument("--crop-size", type=int, default=512, help="the crop size of the train image")
     parser.add_argument(
@@ -33,7 +34,7 @@ def main():
     torch.cuda.set_device(int(args.device))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = Bird(args.data_path, args.crop_size, 8, split="val")
+    dataset = Bird(args.data_path, args.crop_size, 8, split=args.split)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
 
     density_map_path = None
@@ -56,6 +57,7 @@ def main():
     model.eval()
 
     image_errs = []
+    ground_truths = []
     for img, inputs, count, name in dataloader:
         inputs = inputs.to(device, non_blocking=True).float()
         count = count[0].item()
@@ -67,6 +69,7 @@ def main():
 
         print(name, img_err, count, outputs.sum().item())
         image_errs.append(img_err)
+        ground_truths.append(count)
 
         if density_map_path is not None:
             original_img = cv2.imread(img[0])
@@ -123,7 +126,10 @@ def main():
     image_errs = np.array(image_errs)
     mse = np.sqrt(np.mean(np.square(image_errs)))
     mae = np.mean(np.abs(image_errs))
-    print(f"{args.model}: mae {mae}, mse {mse}\n")
+    average_cnt = np.mean(ground_truths)
+    acc = 1 - mae / average_cnt
+    print(f"Total Instance: {sum(ground_truths)}")
+    print(f"{args.model}: mae {mae}, mse {mse}, acc {acc}\n")
 
 
 if __name__ == "__main__":
