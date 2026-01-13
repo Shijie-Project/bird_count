@@ -163,5 +163,5 @@ with col2:
 # --- 键盘快捷键提示 ---
 st.sidebar.markdown("---")
 st.sidebar.markdown("**提示:**")
-st.sidebar.markdown("- 确保你的数据结构符合 `Split/images` 和 `Split/anno_cnt`")
+st.sidebar.markdown("- 确保你的数据结构符合 `Split/images` 和 `Split/annotations`")
 st.sidebar.markdown("- 标注文件格式应为 `.txt`，每行 `x y`")

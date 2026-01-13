@@ -19,10 +19,10 @@ def get_args():
     parser.add_argument("--split", default="train", choices=["val", "train"], help="split dataset")
     parser.add_argument("--model", default="shufflenet", choices=["vgg", "shufflenet"], help="model name")
     parser.add_argument("--checkpoint", type=str, default="./ckpts/shufflenet_model_best.pth", help="saved model path")
-    parser.add_argument("--data-path", type=str, default="./data/indoor/", help="saved model path")
+    parser.add_argument("--data-path", type=str, default="./data", help="saved model path")
     parser.add_argument("--crop-size", type=int, default=512, help="the crop size of the train image")
     parser.add_argument(
-        "--density-map-path", type=str, default="./density_maps", help="folder to save predicted density maps."
+        "--density-map-path", type=str, default="./data/density_maps", help="folder to save predicted density maps."
     )
     args = parser.parse_args()
     return args
