@@ -59,24 +59,24 @@ class AverageMeter:
         self.reset()
 
     def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+        self._val = 0
+        self._avg = 0
+        self._sum = 0
+        self._count = 0
 
     def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = 1.0 * self.sum / self.count
+        self._val = val
+        self._sum += val * n
+        self._count += n
+        self._avg = 1.0 * self._sum / self._count
 
     @property
-    def val_str(self):
-        return f"{self.val:.4f}"
+    def val(self):
+        return self._val
 
     @property
-    def avg_str(self):
-        return f"{self.avg:.4f}"
+    def avg(self):
+        return self._avg
 
 
 class Logger:
