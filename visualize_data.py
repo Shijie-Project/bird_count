@@ -46,7 +46,7 @@ def load_annotation(img_path, root_path, split):
     """根据图片路径加载对应的 .txt 标注"""
     file_name = os.path.basename(img_path).rsplit(".", 1)[0]
     anno_path = os.path.join(root_path, "annotations", split, file_name + ".txt")
-    points = None
+    points = np.empty((0, 2))
     if os.path.exists(anno_path):
         try:
             data = np.loadtxt(anno_path, ndmin=2)
@@ -230,7 +230,7 @@ with col1:
 
         # 转换坐标
         gt_points_abs = points
-        if points is not None and points.shape[1] == 3:  # 假设是 class, x, y 归一化格式
+        if points.shape[1] == 3:  # 假设是 class, x, y 归一化格式
             gt_points_abs = points[:, 1:] * np.array([w, h])
 
         # 画点
