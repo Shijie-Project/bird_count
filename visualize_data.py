@@ -44,10 +44,6 @@ def load_annotation(img_path, root_path, split):
             data = np.loadtxt(anno_path, ndmin=2)
             if data.size > 0:
                 points = data
-
-                if points.shape == 3:
-                    points = points[:, 1:]  # the first dimension is cls.
-
         except Exception:
             pass
     return points, anno_path
@@ -112,6 +108,12 @@ with col1:
     # --- 绘图逻辑 ---
     # 读取图片 (OpenCV format)
     img_cv = cv2.imread(curr_img_path)
+    h, w, c = img_cv.shape
+
+    if points.shape[1] == 3:
+        points = points[:, 1:]
+        points = points * np.array([w, h])
+
     img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
 
     # 绘制点
@@ -119,7 +121,7 @@ with col1:
     point_color = (255, 0, 0)  # 红色
 
     for p in points:
-        x, y = int(p[0]), int(p[1])
+        x, y = round(p[0]), round(p[1])
         cv2.circle(img_cv, (x, y), point_radius, point_color, -1)  # 实心点
         # 可选：画个圈强调
         cv2.circle(img_cv, (x, y), point_radius + 2, (255, 255, 255), 1)
