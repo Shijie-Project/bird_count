@@ -1,7 +1,6 @@
 import os
 import random
 from glob import glob
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -29,8 +28,7 @@ class Bird(data.Dataset):
         if split not in ["train", "val"]:
             raise Exception("not implement")
 
-        im_list = glob(os.path.join(self.root_path, "images", split, "*.jpg"))
-        im_list = (im for im in im_list if not Path(im).stem.lower().startswith(("4k", "ptz")))
+        im_list = list(glob(os.path.join(self.root_path, "images", split, "*.jpg")))
 
         self.im_list = sorted(im_list)
         print(f"number of img: {len(self.im_list)}")
@@ -50,9 +48,9 @@ class Bird(data.Dataset):
 
         if self.split == "train":
             return self.train_transform(img, keypoints)
-        elif self.split == "val":
-            img = self.trans(img)
-            return img, len(keypoints), name
+
+        img = self.trans(img)
+        return img_path, img, len(keypoints), name
 
     def train_transform(self, img, keypoints):
         wd, ht = img.size
