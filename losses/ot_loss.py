@@ -4,7 +4,7 @@ from torch.nn import Module
 from .bregman_pytorch import sinkhorn
 
 
-class OTLoss(Module):
+class OT_Loss(Module):
     def __init__(self, c_size, stride, norm_cood, device, num_of_iter_in_ot=100, reg=10.0):
         super().__init__()
         assert c_size % stride == 0
@@ -43,6 +43,7 @@ class OTLoss(Module):
                 x_dis.unsqueeze_(1)
                 dis = y_dis + x_dis
                 dis = dis.view((dis.size(0), -1))  # size of [#gt, #cood * #cood]
+
                 source_prob = normed_density[idx][0].view([-1]).detach()
                 target_prob = (torch.ones([len(im_points)]) / len(im_points)).to(self.device)
                 # use sinkhorn to solve OT, compute optimal beta.
