@@ -34,12 +34,12 @@ class VGG19DensityNet(nn.Module):
         mu = self.density_layer(x)
 
         B, C, H, W = mu.size()
-        mu_sum = mu.view([B, -1]).sum(1).unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        mu_sum = mu.view([B, -1]).sum(1).view(B, 1, 1, 1)
         mu_normed = mu / (mu_sum + 1e-6)
         return mu, mu_normed
 
 
-def VGG19():
+def get_vgg19_density_model():
     """VGG 19-layer model (configuration "E") model pre-trained on ImageNet"""
     vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
     return VGG19DensityNet(features=vgg.features)

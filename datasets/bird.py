@@ -39,11 +39,15 @@ class Bird(data.Dataset):
         name = os.path.basename(img_path).split(".")[0]
 
         img = Image.open(img_path).convert("RGB")
+        h, w = img.size
 
         keypoints = np.loadtxt(os.path.join(self.root_path, "annotations", self.split, name + ".txt"), ndmin=2)
         keypoints = np.array(keypoints)
 
-        if self.split == "train":
+        if keypoints.shape[1] == 3:
+            keypoints = keypoints[:, 1:] * np.array([w, h])
+
+        if "train" in self.split:
             return self.train_transform(img, keypoints)
 
         img = self.trans(img)

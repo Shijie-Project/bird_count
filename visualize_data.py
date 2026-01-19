@@ -17,7 +17,7 @@ from models.shufflenet import get_shufflenet_density_model
 warnings.filterwarnings("ignore")
 
 # ================= 配置区域 =================
-DEFAULT_DATA_ROOT = "./data/"
+DEFAULT_DATA_ROOT = "./data"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ===========================================
 
@@ -35,10 +35,7 @@ def load_data(root_path, split):
     img_dir = os.path.join(root_path, "images", split)
     if not os.path.exists(img_dir):
         return []
-    extensions = ["*.jpg", "*.png", "*.jpeg"]
-    img_files = []
-    for ext in extensions:
-        img_files.extend(glob.glob(os.path.join(img_dir, ext)))
+    img_files = list(glob.glob(os.path.join(img_dir, "*.jpg")))
     return sorted(img_files)
 
 

@@ -10,8 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 
 from datasets.bird import Bird
-from losses.ot_loss import OTLoss
-from models.shufflenet import get_shufflenet_density_model
+from losses.ot_loss import OT_Loss
 from utils import AverageMeter, Logger, SaveHandle
 
 
@@ -50,9 +49,10 @@ class Trainer:
             raise Exception("gpu is not available")
 
         downsample_ratio = 8
+        data_suffix = "_legacy" if args.legacy_data else ""
         self.datasets = {
-            "train": Bird(args.data_dir, args.crop_size, downsample_ratio, "train"),
-            "val": Bird(args.data_dir, args.crop_size, downsample_ratio, "val"),
+            "train": Bird(args.data_dir, args.crop_size, downsample_ratio, "train" + data_suffix),
+            "val": Bird(args.data_dir, args.crop_size, downsample_ratio, "val" + data_suffix),
         }
 
         self.dataloaders = {
@@ -67,8 +67,16 @@ class Trainer:
             )
             for x in ["train", "val"]
         }
-        # self.model = vgg19()
-        self.model = get_shufflenet_density_model()
+        if args.model == "vgg":
+            from models.vgg import get_vgg19_density_model
+
+            self.model = get_vgg19_density_model()
+
+        elif args.model == "shufflenet":
+            from models.shufflenet import get_shufflenet_density_model
+
+            self.model = get_shufflenet_density_model()
+
         self.model.to(self.device)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -86,18 +94,9 @@ class Trainer:
         else:
             self.logger.info("random initialization")
 
-        self.ot_loss = OTLoss(
+        self.ot_loss = OT_Loss(
             args.crop_size, downsample_ratio, args.norm_cood, self.device, args.num_of_iter_in_ot, args.reg
         )
-        print("crop_size:")
-        print(args.crop_size)
-        print("Downsample_ratio:")
-        print(downsample_ratio)
-        print("Norm_cood:")
-        print(args.norm_cood)
-        print("reg:")
-        print(args.reg)
-
         self.tv_loss = nn.L1Loss(reduction="none").to(self.device)
         self.mse = nn.MSELoss().to(self.device)
         self.mae = nn.L1Loss().to(self.device)

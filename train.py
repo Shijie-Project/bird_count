@@ -18,8 +18,10 @@ def str2bool(v):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train")
     # parser.add_argument('--data-dir', default='D:/data/bird_count/split', help='data path')
+    parser.add_argument("--model", default="shufflenet", choices=["vgg", "shufflenet"], help="model name")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument("--data-dir", default="./data", help="data path")
+    parser.add_argument("--legacy-data", action="store_true", help="whether to use legacy data format")
     parser.add_argument("--lr", type=float, default=1e-5, help="the initial learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="the weight decay")
     parser.add_argument("--resume", default="", type=str, help="the path of resume training model")
