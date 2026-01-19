@@ -14,7 +14,6 @@ from .utils import gen_discrete_map, random_crop
 
 class Bird(data.Dataset):
     def __init__(self, root_path, crop_size, downsample_ratio=8, split="train"):
-        super().__init__()
         self.root_path = root_path
         self.c_size = crop_size
         self.d_ratio = downsample_ratio
@@ -25,12 +24,10 @@ class Bird(data.Dataset):
         )
 
         self.split = split
-        if split not in ["train", "val"]:
-            raise Exception("not implement")
+        assert split in ("train", "val", "train_legacy", "val_legacy")
 
-        im_list = list(glob(os.path.join(self.root_path, "images", split, "*.jpg")))
-
-        self.im_list = sorted(im_list)
+        self.im_list = list(glob(os.path.join(self.root_path, "images", split, "*.jpg")))
+        self.im_list.sort()
         print(f"number of img: {len(self.im_list)}")
 
     def __len__(self):
@@ -91,6 +88,7 @@ class Bird(data.Dataset):
             if random.random() > 0.5:
                 img = F.hflip(img)
                 gt_discrete = np.fliplr(gt_discrete)
+
         gt_discrete = np.expand_dims(gt_discrete, 0)
 
         return (
