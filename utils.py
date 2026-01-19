@@ -9,6 +9,9 @@ import numpy as np
 import torch
 
 
+logger = logging.getLogger(__name__)
+
+
 def set_seed(seed):
     """Set random seed for reproducibility."""
     random.seed(seed)
@@ -43,13 +46,14 @@ class SaveHandle:
 
         self.save_queue.append(save_path)
 
-    def remove_file(self, path):
+    @staticmethod
+    def remove_file(path):
         try:
             if os.path.exists(path):
                 os.remove(path)
-                logging.info(f"Removed old checkpoint: {path}")
+                logger.info(f"Removed old checkpoint: {path}")
         except Exception as e:
-            logging.warning(f"Failed to remove {path}: {e}")
+            logger.warning(f"Failed to remove {path}: {e}")
 
 
 class AverageMeter:
@@ -77,6 +81,10 @@ class AverageMeter:
     @property
     def avg(self):
         return self._avg
+
+    @property
+    def count(self):
+        return self._count
 
 
 class Logger:
