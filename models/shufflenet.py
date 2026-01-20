@@ -5,28 +5,22 @@ import torchvision
 from torchvision.models import ShuffleNet_V2_X1_0_Weights
 
 
-HEAD_IN_CHANNELS = 512
-
-
 class ShuffleNetDensityNet(nn.Module):
-    def __init__(self, features, head_in_channels: int = HEAD_IN_CHANNELS):
+    def __init__(self, features):
         super().__init__()
         self.features = features
 
-        out_channels = self._infer_out_channels()
-
-        self.conv_adapter = nn.Sequential(
-            nn.Conv2d(out_channels, head_in_channels, kernel_size=1, padding=0),
-            nn.ReLU(inplace=True),
-        )
+        in_ch = self._infer_out_channels()
 
         self.reg_layer = nn.Sequential(
-            nn.Conv2d(head_in_channels, 256, kernel_size=3, padding=1),
+            nn.Conv2d(in_ch, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        self.density_layer = nn.Sequential(nn.Conv2d(128, 1, kernel_size=1), nn.ReLU(inplace=True))
+        self.density_layer = nn.Sequential(nn.Conv2d(128, 1, 1), nn.ReLU())
 
     @torch.no_grad()
     def _infer_out_channels(self) -> int:
@@ -35,13 +29,16 @@ class ShuffleNetDensityNet(nn.Module):
         y = self.features(x)
         return y.shape[1]
 
+    def train(self, mode=True):
+        super().train(mode)
+        for m in self.features.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
     def forward(self, x):
         # Feature extraction via ShuffleNet
         x = self.features(x)
-        x = self.conv_adapter(x)
 
-        # Upsampling (If your ShuffleNet features are 1/16, this upsamples to 1/8)
-        # Note: If VGG was 1/8 downsampling, ShuffleNet may be 1/16. Check your feature sizes.
         x = F.interpolate(x, scale_factor=4, mode="bilinear", align_corners=False)
 
         # Density Estimation Head
@@ -49,8 +46,8 @@ class ShuffleNetDensityNet(nn.Module):
         mu = self.density_layer(x)
 
         # Normalization (MUNIT block)
-        b = mu.shape[0]
-        mu_sum = mu.flatten(1).sum(dim=1, keepdim=True).view(b, 1, 1, 1)
+        B, C, H, W = mu.size()
+        mu_sum = mu.view([B, -1]).sum(1).view(B, 1, 1, 1)
         mu_normed = mu / (mu_sum + 1e-6)
         return mu, mu_normed
 

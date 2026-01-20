@@ -125,6 +125,7 @@ class Trainer:
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
         epoch_start = time.time()
+
         self.model.train()  # Set model to training mode
 
         for step, (inputs, points, gt_discrete) in enumerate(self.dataloaders["train"]):
@@ -202,7 +203,7 @@ class Trainer:
         epoch_start = time.time()
         self.model.eval()  # Set model to evaluate mode
         epoch_res = []
-        for inputs, count, name in self.dataloaders["val"]:
+        for img, inputs, count, name in self.dataloaders["val"]:
             inputs = inputs.to(self.device)
             assert inputs.size(0) == 1, "the batch size should equal to 1 in validation mode"
             with torch.set_grad_enabled(False):
