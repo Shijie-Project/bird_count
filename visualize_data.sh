@@ -1,0 +1,1 @@
+streamlit run ./visualize_data.py

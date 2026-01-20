@@ -1,0 +1,1 @@
+label-studio start --data-dir ./data

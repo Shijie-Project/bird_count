@@ -134,7 +134,7 @@ def run_inference(model, img_rgb):
 # --- Sidebar: 设置 ---
 st.sidebar.title("🛠️ 设置")
 data_root = st.sidebar.text_input("数据集根目录", value=DEFAULT_DATA_ROOT)
-split = st.sidebar.selectbox("数据划分 (Split)", ["train", "val", "test"])
+split = st.sidebar.selectbox("数据划分 (Split)", os.listdir(os.path.join(data_root, "images")))
 
 # --- 加载数据 ---
 image_files = load_data(data_root, split)
