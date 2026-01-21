@@ -42,7 +42,7 @@ def main():
     if args.density_map_path:
         import cv2
 
-        density_map_path = os.path.join(args.density_map_path, args.model)
+        density_map_path = os.path.join(args.density_map_path, args.checkpoint.split("/")[-1].split(".")[0])
         if not os.path.exists(density_map_path):
             os.makedirs(density_map_path)
 
@@ -56,9 +56,9 @@ def main():
     ground_truths = []
     accuracies = []  # 新增：用于存储每张图片的准确率
 
-    for img, inputs, count, name in dataloader:
+    for img, inputs, gt_discrete, name in dataloader:
         inputs = inputs.to(device, non_blocking=True).float()
-        count = count[0].item()
+        count = gt_discrete[0].sum().item()
 
         with torch.set_grad_enabled(False):
             outputs, _ = model(inputs)
