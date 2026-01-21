@@ -39,7 +39,7 @@ class ShuffleNetDensityNet(nn.Module):
         # Feature extraction via ShuffleNet
         x = self.features(x)
 
-        x = F.interpolate(x, scale_factor=4, mode="bilinear", align_corners=False)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
 
         # Density Estimation Head
         x = self.reg_layer(x)
@@ -54,7 +54,7 @@ class ShuffleNetDensityNet(nn.Module):
 
 def get_shufflenet_density_model():
     backbone = torchvision.models.shufflenet_v2_x1_0(weights=ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1)
-    features = nn.Sequential(*list(backbone.children())[:-2])  # up to stage4 (/32)
+    features = nn.Sequential(*list(backbone.children())[:-3])  # up to stage3 (/16)
     return ShuffleNetDensityNet(features)
 
 

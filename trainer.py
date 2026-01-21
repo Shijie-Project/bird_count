@@ -28,7 +28,7 @@ class Trainer:
 
     def setup(self):
         args = self.args
-        sub_dir = "input-{}_wot-{}_wtv-{}_reg-{}_nIter-{}_normCood-{}-{}".format(
+        sub_dir = "input-{}_wot-{}_wtv-{}_reg-{}_nIter-{}_normCood-{}/{}".format(
             args.crop_size,
             args.wot,
             args.wtv,
