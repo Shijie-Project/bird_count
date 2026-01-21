@@ -28,8 +28,14 @@ class Trainer:
 
     def setup(self):
         args = self.args
-        sub_dir = "input-{}_wot-{}_wtv-{}_reg-{}_nIter-{}_normCood-{}".format(
-            args.crop_size, args.wot, args.wtv, args.reg, args.num_of_iter_in_ot, args.norm_cood
+        sub_dir = "input-{}_wot-{}_wtv-{}_reg-{}_nIter-{}_normCood-{}-{}".format(
+            args.crop_size,
+            args.wot,
+            args.wtv,
+            args.reg,
+            args.num_of_iter_in_ot,
+            int(args.norm_cood),
+            time.strftime("%Y%m%d-%H%M%S"),
         )
 
         self.save_dir = os.path.join("ckpts", sub_dir)
@@ -203,12 +209,12 @@ class Trainer:
         epoch_start = time.time()
         self.model.eval()  # Set model to evaluate mode
         epoch_res = []
-        for img, inputs, count, name in self.dataloaders["val"]:
+        for img, inputs, gt_discrete, name in self.dataloaders["val"]:
             inputs = inputs.to(self.device)
             assert inputs.size(0) == 1, "the batch size should equal to 1 in validation mode"
             with torch.set_grad_enabled(False):
                 outputs, _ = self.model(inputs)
-                res = count[0].item() - torch.sum(outputs).item()
+                res = gt_discrete[0].sum().item() - torch.sum(outputs).item()
                 epoch_res.append(res)
 
         epoch_res = np.array(epoch_res)

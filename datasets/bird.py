@@ -39,7 +39,7 @@ class Bird(data.Dataset):
         name = os.path.basename(img_path).split(".")[0]
 
         img = Image.open(img_path).convert("RGB")
-        h, w = img.size
+        w, h = img.size
 
         keypoints = np.loadtxt(os.path.join(self.root_path, "annotations", self.split, name + ".txt"), ndmin=2)
         keypoints = np.array(keypoints)
@@ -51,7 +51,14 @@ class Bird(data.Dataset):
             return self.train_transform(img, keypoints)
 
         img = self.trans(img)
-        return img_path, img, len(keypoints), name
+
+        gt_discrete = gen_discrete_map(h, w, keypoints)
+        down_w = w // self.d_ratio
+        down_h = h // self.d_ratio
+        gt_discrete = gt_discrete.reshape([down_h, self.d_ratio, down_w, self.d_ratio]).sum(axis=(1, 3))
+        assert np.sum(gt_discrete) == len(keypoints)
+
+        return img_path, img, gt_discrete, name
 
     def train_transform(self, img, keypoints):
         wd, ht = img.size
@@ -64,8 +71,10 @@ class Bird(data.Dataset):
             st_size = 1.0 * min(wd, ht)
             img = img.resize((wd, ht), Image.BICUBIC)
             keypoints = keypoints * rr
+
         assert st_size >= self.c_size, print(wd, ht)
         assert len(keypoints) >= 0
+
         i, j, h, w = random_crop(ht, wd, self.c_size, self.c_size)
         img = F.crop(img, i, j, h, w)
         if len(keypoints) > 0:

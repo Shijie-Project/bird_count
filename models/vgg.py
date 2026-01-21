@@ -42,4 +42,5 @@ class VGG19DensityNet(nn.Module):
 def get_vgg19_density_model():
     """VGG 19-layer model (configuration "E") model pre-trained on ImageNet"""
     vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
-    return VGG19DensityNet(features=vgg.features)
+    features = nn.Sequential(*list(vgg.features.children())[:-1])
+    return VGG19DensityNet(features=features)
