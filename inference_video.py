@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from handlers import VisualizationHandler
+from handlers import Handlers
 from models.shufflenet import get_shufflenet_density_model
 
 
@@ -58,7 +58,7 @@ class Config:
     NUM_WORKERS_PER_GPU: int = 1
 
     # Sources
-    SOURCE: Literal["video", "rtsp", "camera"] = field(default="video")
+    SOURCE: Literal["video", "rtsp", "camera"] = field(default="camera")
     VIDEO_PATH: tuple[str, ...] = ("./data/bird_count/bird_count_demo.mp4",)
     RTSP_URL: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
     CAMERA_ADD: tuple[str, ...] = (
@@ -70,6 +70,21 @@ class Config:
         "http://root:root@138.25.209.203/mjpg/1/video.mjpg",
     )
 
+    # Monitor
+    ENABLE_MONITOR: bool = True
+
+    # Smart plugs
+    TAPO_DEVICES = {
+        "zone1": "192.168.0.185",
+        "zone2": "192.168.0.198",
+        "zone3": "192.168.0.102",
+        "zone4": "192.168.0.195",
+        "zone5": "192.168.0.130",
+        "zone6": "192.168.0.164",
+        "zone7": "192.168.0.110",
+    }
+    ENABLE_SMART_PLUG = True
+
     # Stream
     TARGET_FPS: float = 10.0
     NUM_STREAMS: int = 22
@@ -77,9 +92,6 @@ class Config:
 
     # Buffer
     NUM_BUFFER: int = 10  # Suggest using >= 5 for stability with locking
-
-    # Monitor
-    ENABLE_MONITOR: bool = True
 
     # Auto-calculated fields
     frame_interval_s: float = field(init=False)
@@ -401,30 +413,29 @@ class ResultProcessor(mp.Process):
                     sid = item.sids[i]
                     buf_idx = item.buffer_indices[i]
 
-                    if self.cfg.ENABLE_MONITOR:
-                        # Visualization Logic
-                        vis_map = item.outputs[i, 0]  # Assuming (B, 1, H, W) layout
-                        orig_img = batch_orig_frames[i]
+                    # Visualization Logic
+                    vis_map = item.outputs[i, 0]  # Assuming (B, 1, H, W) layout
+                    orig_img = batch_orig_frames[i]
 
-                        norm_map = (vis_map - vis_map.min()) / (vis_map.max() - vis_map.min() + 1e-5)
-                        norm_map = cv2.resize(norm_map, (orig_img.shape[1], orig_img.shape[0]))
-                        mask = norm_map > threshold
+                    norm_map = (vis_map - vis_map.min()) / (vis_map.max() - vis_map.min() + 1e-5)
+                    norm_map = cv2.resize(norm_map, (orig_img.shape[1], orig_img.shape[0]))
+                    mask = norm_map > threshold
 
-                        overlay = orig_img.copy()
-                        if mask.any():
-                            dm_color = cv2.applyColorMap((norm_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
-                            dm_color = cv2.cvtColor(dm_color, cv2.COLOR_BGR2RGB)
+                    overlay = orig_img.copy()
+                    if mask.any():
+                        dm_color = cv2.applyColorMap((norm_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                        dm_color = cv2.cvtColor(dm_color, cv2.COLOR_BGR2RGB)
 
-                            blended = cv2.addWeighted(orig_img[mask], alpha, dm_color[mask], beta, 0)
-                            overlay[mask] = blended
+                        blended = cv2.addWeighted(orig_img[mask], alpha, dm_color[mask], beta, 0)
+                        overlay[mask] = blended
 
-                        final_vis_batch.append(overlay)
+                    final_vis_batch.append(overlay)
 
                     # --- CRITICAL: UNLOCK BUFFER ---
                     # Mark buffer as Free (0.0) so Grabber can reuse it
                     buffer_meta[sid, buf_idx, 0] = 0.0
 
-                if self.cfg.ENABLE_MONITOR and final_vis_batch:
+                if final_vis_batch:
                     # Stack list to numpy array for the handler
                     vis_np = np.stack(final_vis_batch)
                     for h in self.handlers:
@@ -768,7 +779,7 @@ def run_scheduler(cfg: Config):
 
     # 5. Start Result Processor
     # Pass SHM info to RP so it can attach and read original frames
-    handlers = [VisualizationHandler(cfg)]
+    handlers = [handler(cfg) for handler in Handlers]
     res_proc = ResultProcessor(
         result_queue,
         shutdown_event,
