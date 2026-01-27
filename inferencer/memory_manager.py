@@ -2,7 +2,7 @@ import logging
 import multiprocessing.shared_memory as shm
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -26,6 +26,7 @@ class SharedMemoryManager:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+
         # Structure: [NUM_STREAMS, NUM_BUFFER, H, W, 3] (uint8)
         self.shape = (cfg.NUM_STREAMS, cfg.NUM_BUFFER, cfg.INPUT_H, cfg.INPUT_W, 3)
         self.dtype = np.uint8
@@ -79,19 +80,15 @@ class SharedMetadataManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-        # --- 1. Define Metadata Shape ---
-        # [Streams, Features(State, Timestamp)]
-        self.shape = (cfg.NUM_STREAMS, 2)
+        # Structure: [Streams, NUM_BUFFER, Features(State, Timestamp)]
+        self.shape = (cfg.NUM_STREAMS, cfg.NUM_BUFFER, 2)
         self.dtype = np.float64
         self.nbytes = int(np.prod(self.shape) * np.dtype(self.dtype).itemsize)
 
         self.shm_name = f"shm_meta_{time.time()}"
 
-        # Resources
         self.shm: Optional[shm.SharedMemory] = None
         self.buffer: Optional[np.ndarray] = None
-        self.latest_cursor: Optional[Any] = None  # multiprocessing.Array
-
         self._linked = False
 
     def create(self) -> SharedMemoryInfo:
