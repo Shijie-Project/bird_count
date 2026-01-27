@@ -1,4 +1,5 @@
 import logging
+import multiprocessing as mp
 import multiprocessing.shared_memory as shm
 import time
 from dataclasses import dataclass
@@ -89,12 +90,12 @@ class SharedMetadataManager:
 
         self.shm: Optional[shm.SharedMemory] = None
         self.buffer: Optional[np.ndarray] = None
+        self.latest_cursor = None
         self._linked = False
 
     def create(self) -> SharedMemoryInfo:
         """
         Allocates shared metadata memory and initializes the cursor.
-        Returns: (shm_name, latest_cursor_proxy)
         """
         try:
             self.shm = shm.SharedMemory(create=True, size=self.nbytes, name=self.shm_name)
@@ -103,8 +104,14 @@ class SharedMetadataManager:
             self.buffer = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm.buf)
             self.buffer.fill(0)  # Init all as Free (0)
 
+            # Create latest cursor (tracks the last written buffer index for each stream)
+            # Init -1 means no data written yet
+            self.latest_cursor = mp.Array("i", self.cfg.NUM_STREAMS)
+            for i in range(self.cfg.NUM_STREAMS):
+                self.latest_cursor[i] = 0
+
             logger.info(f"[Memory] Metadata Shared Memory allocated: {self.nbytes / 1024:.2f} KB")
-            return SharedMemoryInfo(self.shm.name, self.shape, self.dtype)
+            return SharedMemoryInfo(self.shm.name, self.shape, self.dtype), self.latest_cursor
 
         except Exception as e:
             logger.error(f"[Memory] Failed to create metadata shared memory: {e}")
