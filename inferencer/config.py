@@ -34,12 +34,28 @@ class SourceConfig:
     video_paths: tuple[str, ...] = ("./data/bird_count_demo.mp4",)
     rtsp_urls: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
     camera_addresses: tuple[str, ...] = (
-        "http://root:root@138.25.209.105/mjpg/1/video.mjpg",
         "http://root:root@138.25.209.109/mjpg/1/video.mjpg",
         "http://root:root@138.25.209.111/mjpg/1/video.mjpg",
-        "http://root:root@138.25.209.112/mjpg/1/video.mjpg",
         "http://root:root@138.25.209.113/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.112/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.105/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.124/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.125/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.126/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.108/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.120/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.123/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.129/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.127/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.128/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.134/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.121/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.122/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.131/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.132/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.106/mjpg/1/video.mjpg",
         "http://root:root@138.25.209.203/mjpg/1/video.mjpg",
+        "http://root:root@138.25.209.206/mjpg/1/video.mjpg",
     )
 
     def get_raw_sources(self) -> tuple[str, ...]:
@@ -59,7 +75,7 @@ class StreamConfig:
 
     # Buffer settings
     num_buffer: int = 4
-    enable_monitor: bool = True
+    enable_monitor: bool = False
 
     # Auto-calculated
     frame_interval_s: float = field(init=False)
@@ -75,16 +91,18 @@ class StreamConfig:
 @dataclass
 class SmartPlugConfig:
     enable: bool = True
+    email: str = "allenliu0416@163.com"
+    password: str = "LTX4947978"
     devices: dict[str, str] = field(
-        default_factory=lambda: {
-            "zone1": "192.168.0.185",
-            "zone2": "192.168.0.198",
-            "zone3": "192.168.0.102",
-            "zone4": "192.168.0.195",
-            "zone5": "192.168.0.130",
-            "zone6": "192.168.0.164",
-            "zone7": "192.168.0.110",
-        }
+        default_factory=lambda: [
+            "192.168.0.185",
+            "192.168.0.198",
+            "192.168.0.102",
+            "192.168.0.195",
+            "192.168.0.130",
+            "192.168.0.164",
+            "192.168.0.110",
+        ]
     )
 
 

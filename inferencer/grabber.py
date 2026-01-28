@@ -98,8 +98,6 @@ class FrameGrabber(threading.Thread):
                     break
 
             cap.release()
-            existing_shm_frames.close()
-            existing_shm_meta.close()
 
     def process_grabber_frame(
         self,
