@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from pprint import pformat
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -11,21 +11,29 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Config:
-    # Model Settings
-    MODEL_PATH: str = "./ckpts/shufflenet_best_model_214800.pth"
-    INPUT_H: int = 512
-    INPUT_W: int = 512
+class ModelConfig:
+    path: str = "./ckpts/shufflenet_best_model_214800.pth"
+    input_h: int = 512
+    input_w: int = 512
 
-    # Hardware Settings
-    AVAILABLE_GPUS: tuple[int, ...] = tuple(range(torch.cuda.device_count()))
-    NUM_WORKERS_PER_GPU: int = 1
 
-    # Sources
-    SOURCE: Literal["video", "rtsp", "camera"] = field(default="camera")
-    VIDEO_PATH: tuple[str, ...] = ("./data/bird_count_demo.mp4",)
-    RTSP_URL: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
-    CAMERA_ADD: tuple[str, ...] = (
+@dataclass
+class HardwareConfig:
+    available_gpus: tuple[int, ...] = field(default_factory=lambda: tuple(range(torch.cuda.device_count())))
+    num_workers_per_gpu: int = 1
+
+    @property
+    def total_workers(self) -> int:
+        return len(self.available_gpus) * self.num_workers_per_gpu
+
+
+@dataclass
+class SourceConfig:
+    mode: Literal["video", "rtsp", "camera"] = "camera"
+
+    video_paths: tuple[str, ...] = ("./data/bird_count_demo.mp4",)
+    rtsp_urls: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
+    camera_addresses: tuple[str, ...] = (
         "http://root:root@138.25.209.105/mjpg/1/video.mjpg",
         "http://root:root@138.25.209.109/mjpg/1/video.mjpg",
         "http://root:root@138.25.209.111/mjpg/1/video.mjpg",
@@ -34,58 +42,103 @@ class Config:
         "http://root:root@138.25.209.203/mjpg/1/video.mjpg",
     )
 
-    # Monitor
-    ENABLE_MONITOR: bool = True
+    def get_raw_sources(self) -> tuple[str, ...]:
+        source_maps = {
+            "video": self.video_paths,
+            "rtsp": self.rtsp_urls,
+            "camera": self.camera_addresses,
+        }
+        return source_maps[self.mode]
 
-    # Smart plugs
-    TAPO_DEVICES = {
-        "zone1": "192.168.0.185",
-        "zone2": "192.168.0.198",
-        "zone3": "192.168.0.102",
-        "zone4": "192.168.0.195",
-        "zone5": "192.168.0.130",
-        "zone6": "192.168.0.164",
-        "zone7": "192.168.0.110",
-    }
-    ENABLE_SMART_PLUG = True
 
-    # Stream
-    TARGET_FPS: float = 10.0
-    NUM_STREAMS: int = 22
-    RUNTIME_SECONDS: Optional[int] = None
+@dataclass
+class StreamConfig:
+    target_fps: float = 10.0
+    num_streams: int = 22
+    runtime_seconds: Optional[int] = None
 
-    # Buffer
-    NUM_BUFFER: int = 10  # Suggest using >= 5 for stability with locking
+    # Buffer settings
+    num_buffer: int = 4
+    enable_monitor: bool = True
 
-    # Auto-calculated fields
+    # Auto-calculated
     frame_interval_s: float = field(init=False)
-    stream_sources: tuple[str, ...] = field(init=False)
 
     def __post_init__(self):
-        # Clamp FPS
-        if self.TARGET_FPS < 1 or self.TARGET_FPS > 60:
-            logger.warning(f"Clamping Target FPS {self.TARGET_FPS} to [1, 60].")
-        self.TARGET_FPS = max(1.0, min(60.0, self.TARGET_FPS))
-        self.frame_interval_s = 1.0 / self.TARGET_FPS
+        # Clamp FPS Logic
+        if self.target_fps < 1 or self.target_fps > 60:
+            logger.warning(f"Clamping Target FPS {self.target_fps} to [1, 60].")
+        self.target_fps = max(1.0, min(60.0, self.target_fps))
+        self.frame_interval_s = 1.0 / self.target_fps
 
-        # Setup Sources
-        source_maps = {
-            "video": self.VIDEO_PATH,
-            "rtsp": self.RTSP_URL,
-            "camera": self.CAMERA_ADD,
+
+@dataclass
+class SmartPlugConfig:
+    enable: bool = True
+    devices: dict[str, str] = field(
+        default_factory=lambda: {
+            "zone1": "192.168.0.185",
+            "zone2": "192.168.0.198",
+            "zone3": "192.168.0.102",
+            "zone4": "192.168.0.195",
+            "zone5": "192.168.0.130",
+            "zone6": "192.168.0.164",
+            "zone7": "192.168.0.110",
         }
-        sources = source_maps[self.SOURCE]
-        # Round-robin fill
-        if len(sources) < self.NUM_STREAMS:
-            sources = sources * (self.NUM_STREAMS // len(sources) + 1)
-        self.stream_sources = tuple(sources[: self.NUM_STREAMS])
+    )
 
+
+@dataclass
+class Config:
+    model: ModelConfig = field(default_factory=ModelConfig)
+    hardware: HardwareConfig = field(default_factory=HardwareConfig)
+    source: SourceConfig = field(default_factory=SourceConfig)
+    stream: StreamConfig = field(default_factory=StreamConfig)
+    smart_plug: SmartPlugConfig = field(default_factory=SmartPlugConfig)
+
+    active_stream_sources: tuple[str, ...] = field(init=False)
+
+    def __post_init__(self):
+        raw_sources = self.source.get_raw_sources()
+        required_streams = self.stream.num_streams
+
+        if len(raw_sources) < required_streams:
+            raw_sources = raw_sources * (required_streams // len(raw_sources) + 1)
+
+        self.active_stream_sources = tuple(raw_sources[:required_streams])
+
+        self._log_initialization()
+
+    def _log_initialization(self):
         logger.info("--- Configuration Initialized ---")
-        logger.info(f"FPS: {self.TARGET_FPS} (Interval: {self.frame_interval_s * 1000:.1f}ms)")
-        logger.info(f"Streams: {self.NUM_STREAMS}")
-        logger.info(f"GPUs: {len(self.AVAILABLE_GPUS)}")
-        logger.info(f"Workers: {len(self.AVAILABLE_GPUS) * self.NUM_WORKERS_PER_GPU}")
-        logger.info(f"Stream Source(s):\n{pformat(self.stream_sources)}")
+        logger.info(f"FPS: {self.stream.target_fps} (Interval: {self.stream.frame_interval_s * 1000:.1f}ms)")
+        logger.info(f"Streams: {self.stream.num_streams}")
+        logger.info(f"GPUs: {len(self.hardware.available_gpus)}")
+        logger.info(f"Workers: {self.hardware.total_workers}")
+        logger.info(f"Active Source(s):\n{pformat(self.active_stream_sources)}")
+
+    @classmethod
+    def from_settings(cls, envs: Any) -> "Config":
+        """
+        Build from pydantic environment variables。
+        """
+        gpu_str = getattr(envs, "cuda_visible_devices", "")
+        if gpu_str:
+            gpus = tuple(int(x) for x in gpu_str.split(",") if x.strip())
+        else:
+            gpus = (0,)
+
+        hw_cfg = HardwareConfig(available_gpus=gpus, num_workers_per_gpu=envs.num_workers_per_gpu)
+
+        stream_cfg = StreamConfig(
+            target_fps=envs.fps,
+            num_streams=envs.num_streams,
+            num_buffer=envs.num_buffer,
+        )
+
+        source_cfg = SourceConfig(mode=envs.source)
+
+        return cls(hardware=hw_cfg, stream=stream_cfg, source=source_cfg)
 
 
 @dataclass

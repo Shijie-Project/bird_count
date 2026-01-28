@@ -29,7 +29,7 @@ class SharedMemoryManager:
         self.cfg = cfg
 
         # Structure: [NUM_STREAMS, NUM_BUFFER, H, W, 3] (uint8)
-        self.shape = (cfg.NUM_STREAMS, cfg.NUM_BUFFER, cfg.INPUT_H, cfg.INPUT_W, 3)
+        self.shape = (cfg.stream.num_streams, cfg.stream.num_buffer, cfg.model.input_h, cfg.model.input_w, 3)
         self.dtype = np.uint8
         self.nbytes = int(np.prod(self.shape) * np.dtype(self.dtype).itemsize)
 
@@ -82,7 +82,7 @@ class SharedMetadataManager:
         self.cfg = cfg
 
         # Structure: [Streams, NUM_BUFFER, Features(State, Timestamp)]
-        self.shape = (cfg.NUM_STREAMS, cfg.NUM_BUFFER, 2)
+        self.shape = (cfg.stream.num_streams, cfg.stream.num_buffer, 2)
         self.dtype = np.float64
         self.nbytes = int(np.prod(self.shape) * np.dtype(self.dtype).itemsize)
 
@@ -93,7 +93,7 @@ class SharedMetadataManager:
         self.latest_cursor = None
         self._linked = False
 
-    def create(self) -> SharedMemoryInfo:
+    def create(self) -> tuple[SharedMemoryInfo, mp.Array]:
         """
         Allocates shared metadata memory and initializes the cursor.
         """
@@ -106,8 +106,8 @@ class SharedMetadataManager:
 
             # Create latest cursor (tracks the last written buffer index for each stream)
             # Init -1 means no data written yet
-            self.latest_cursor = mp.Array("i", self.cfg.NUM_STREAMS)
-            for i in range(self.cfg.NUM_STREAMS):
+            self.latest_cursor = mp.Array("i", self.cfg.stream.num_streams)
+            for i in range(self.cfg.stream.num_streams):
                 self.latest_cursor[i] = 0
 
             logger.info(f"[Memory] Metadata Shared Memory allocated: {self.nbytes / 1024:.2f} KB")

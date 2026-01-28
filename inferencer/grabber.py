@@ -34,7 +34,7 @@ class FrameGrabber(threading.Thread):
         self.stop_event = stop_event
         self.cfg = cfg
 
-        self._interval = cfg.frame_interval_s
+        self._interval = cfg.stream.frame_interval_s
 
     def run(self) -> None:
         # 1. Attach Video Frames SHM
@@ -114,11 +114,11 @@ class FrameGrabber(threading.Thread):
         3. Write data & update metadata.
         """
         # CPU Preprocessing
-        frame = cv2.resize(frame, (self.cfg.INPUT_W, self.cfg.INPUT_H))
+        frame = cv2.resize(frame, (self.cfg.model.input_w, self.cfg.model.input_h))
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         current_idx = self.latest_cursor[self.sid]
-        next_idx = (current_idx + 1) % self.cfg.NUM_BUFFER
+        next_idx = (current_idx + 1) % self.cfg.stream.num_buffer
 
         # 2. Check Buffer State
         # 0.0 = Free, 2.0 = Ready (Overwritable), 1.0 = Locked (Protected)
@@ -145,7 +145,7 @@ class FrameGrabber(threading.Thread):
 
 def spawn_grabbers(cfg, shm_frames_info, shm_meta_info, latest_cursor, stop_event) -> list[FrameGrabber]:
     grabbers = []
-    for i, src in enumerate(cfg.stream_sources):
+    for i, src in enumerate(cfg.active_stream_sources):
         t = FrameGrabber(
             sid=i,
             src=src,
