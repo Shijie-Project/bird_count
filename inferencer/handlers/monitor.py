@@ -144,7 +144,7 @@ class MonitorHandler(BaseResultHandler):
             self.canvas[y_slice, x_slice] = img_resized
 
             bar_height = 28
-            label = f"CH-{sid:02d}: {int(counts[sid])}"
+            label = f"CH-{sid:02d}: {int(counts[i])}"
 
             cv2.rectangle(self.canvas, (x1, y1), (x1 + 90, y1 + bar_height), self.COLOR_BG_BAR, -1)
             cv2.putText(self.canvas, label, (x1 + 5, y1 + 20), cv2.FONT_HERSHEY_DUPLEX, 0.6, self.COLOR_TEXT_ID, 1)
