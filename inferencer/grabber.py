@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as mp
 import multiprocessing.shared_memory as shm
+import re
 import threading
 import time
 
@@ -25,7 +26,11 @@ class FrameGrabber(threading.Thread):
         stop_event: threading.Event,
         cfg: Config,
     ) -> None:
-        super().__init__(daemon=True, name=f"grabber-{sid}")
+        pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+        match = re.search(pattern, src)
+        self.ip = match.group(0) if match else src
+
+        super().__init__(daemon=True, name=f"grabber-{self.ip}")
         self.sid = sid
         self.src = src
         self.shm_frames_info = shm_frames_info
@@ -45,7 +50,7 @@ class FrameGrabber(threading.Thread):
             )
             shm_frames = full_frames[self.sid]  # [NUM_BUFFER, H, W, 3]
         except Exception as e:
-            logger.error(f"[Stream {self.sid}] Frames SHM attach failed: {e}")
+            logger.error(f"[Stream {self.ip}] Frames SHM attach failed: {e}")
             return
 
         # 2. Attach Metadata SHM
@@ -56,24 +61,24 @@ class FrameGrabber(threading.Thread):
             )
             shm_meta = full_meta[self.sid]
         except Exception as e:
-            logger.error(f"[Stream {self.sid}] Meta SHM attach failed: {e}")
+            logger.error(f"[Stream {self.ip}] Meta SHM attach failed: {e}")
             return
 
         while not self.stop_event.is_set():
             cap = cv2.VideoCapture(self.src)
             if not cap.isOpened():
-                logger.warning(f"[Stream {self.sid}] Connection failed. Retrying in 5s...")
+                logger.warning(f"[Stream {self.ip}] Connection failed. Retrying in 5s...")
                 time.sleep(5)
                 continue
 
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            logger.info(f"[Stream {self.sid}] Connected.")
+            logger.info(f"[Stream {self.ip}] Connected.")
             last_ok_time = time.time()
 
             while not self.stop_event.is_set():
                 if not cap.grab():
                     if time.time() - last_ok_time > 5.0:
-                        logger.warning(f"[Stream {self.sid}] Timeout. Reconnecting...")
+                        logger.warning(f"[Stream {self.ip}] Timeout. Reconnecting...")
                         break
                     time.sleep(0.01)
                     continue
@@ -94,7 +99,7 @@ class FrameGrabber(threading.Thread):
                         time.sleep(wait)
 
                 except Exception as e:
-                    logger.error(f"[Stream {self.sid}] Process error: {e}")
+                    logger.error(f"[Stream {self.ip}] Process error: {e}")
                     break
 
             cap.release()
@@ -124,7 +129,7 @@ class FrameGrabber(threading.Thread):
 
         if state == 1.0:
             # [Flow Control] Target buffer is in use. Drop this frame.
-            logger.debug(f"[Stream {self.sid}] Buffer {next_idx} Locked. Dropping frame.")
+            logger.debug(f"[Stream {self.ip}] Buffer {next_idx} Locked. Dropping frame.")
             return
 
         # 3. Write Data (Zero Copy)

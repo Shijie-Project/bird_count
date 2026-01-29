@@ -34,15 +34,12 @@ class SmartPlugHandler(BaseResultHandler):
         self.timeout_seconds = cfg.smart_plug.timeout_seconds
         self.alert_threshold = cfg.smart_plug.alert_threshold
 
-        # Device Mapping: {'zone1': '192.168.1.100', 'zone2': '192.168.1.101'}
-        self.device_ips: list[str] = cfg.smart_plug.devices
+        # Device Mapping: {'192.168.1.100': [1,2,3], 'zone2': '192.168.1.101'}
+        self.ip_to_sids: dict[str, list[int]] = cfg.smart_plug.device_maps
         self.sid_to_ip: dict[int, str] = {}
-        for idx, ip in enumerate(self.device_ips):
-            self.sid_to_ip[idx] = ip
-
-        # 2. State Management
-        # Stores the last known state of the plug (True=ON, False=OFF, None=Unknown)
-        self.current_states: dict[str, Optional[bool]] = dict.fromkeys(self.device_ips)
+        for ip, sids in self.ip_to_sids.items():
+            for sid in sids:
+                self.sid_to_ip[sid] = ip
 
         # 3. Concurrency Control
         # A set to track devices currently performing network I/O
@@ -51,7 +48,7 @@ class SmartPlugHandler(BaseResultHandler):
         # Initialize internal lock variable as None (Lazy Loading)
         self._lock: Optional[threading.Lock] = None
 
-        logger.info(f"[Plug] Initialized. Monitoring {len(self.device_ips)} devices.")
+        logger.info(f"[Plug] Initialized. Monitoring {len(self.ip_to_sids.items())} devices.")
 
         # Reset all devices to OFF on startup
         self._reset_all_devices_off()
@@ -85,9 +82,9 @@ class SmartPlugHandler(BaseResultHandler):
             return
 
         logger.info("[Plug] Resetting all devices to OFF...")
-        for ip in self.device_ips:
+        for ip in self.ip_to_sids.keys():
             threading.Thread(
-                target=self._control_one_device_task,
+                target=self._run_async_single_control,
                 args=(ip, False),  # False = OFF
                 daemon=True,
                 name=f"Init-Reset-{ip}",
@@ -102,22 +99,16 @@ class SmartPlugHandler(BaseResultHandler):
 
         # Step 1: Determine Target States for each IP
         # Default all to False (OFF)
-        target_states = dict.fromkeys(self.device_ips, False)
+        target_states = dict.fromkeys(self.ip_to_sids, False)
 
         # Iterate through detected streams
         for sid, count in zip(sids, counts):
             # Logic: Turn ON if count > threshold
             if count > self.alert_threshold:
-                # Retrieve the IP associated with this stream ID
-                if sid in self.sid_to_ip:
-                    target_ip = self.sid_to_ip[sid]
-
-                    # Verify this IP is managed by us
-                    if target_ip in target_states:
-                        target_states[target_ip] = True
+                target_states[self.sid_to_ip[sid]] = True
 
         # Step 2: Actuate Devices (Independent Threads)
-        for ip in self.device_ips:
+        for ip in target_states:
             should_be_on = target_states[ip]
 
             # A. Check if IP is busy (Thread-safe)
@@ -130,13 +121,32 @@ class SmartPlugHandler(BaseResultHandler):
                 continue
 
             # B. Check if state change is needed
-            if self.current_states.get(ip) != should_be_on:
+            if should_be_on:
                 threading.Thread(
-                    target=self._control_one_device_task,
+                    target=self._run_async_single_control,
                     args=(ip, should_be_on),
                     daemon=True,
                     name=f"Thread-Plug-{ip}",
                 ).start()
+
+    def _run_async_single_control(self, ip: str, turn_on: bool):
+        """
+        Thread entry point. Manages the 'busy' flag for a specific IP.
+        """
+        # 1. Mark Busy
+        with self.lock:
+            self.busy_ips.add(ip)
+
+        try:
+            # Run async control in this thread
+            asyncio.run(self._control_one_device_task(ip, turn_on))
+        except Exception as e:
+            logger.error(f"[Plug] Thread error for {ip}: {e}")
+        finally:
+            # 2. Unmark Busy
+            with self.lock:
+                if ip in self.busy_ips:
+                    self.busy_ips.remove(ip)
 
     async def _control_one_device_task(self, ip: str, turn_on: bool):
         """

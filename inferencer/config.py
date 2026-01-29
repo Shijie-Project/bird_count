@@ -34,29 +34,32 @@ class SourceConfig:
     video_paths: tuple[str, ...] = ("./data/bird_count_demo.mp4",)
     rtsp_urls: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
     camera_addresses: tuple[str, ...] = (
-        "https://root:root@138.25.209.109/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.111/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.113/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.112/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.105/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.124/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.125/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.126/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.108/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.120/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.123/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.129/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.127/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.128/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.134/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.121/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.122/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.131/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.132/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.106/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.203/mjpg/1/video.mjpg",
-        "https://root:root@138.25.209.206/mjpg/1/video.mjpg",
+        "138.25.209.105",
+        "138.25.209.106",
+        "138.25.209.108",
+        "138.25.209.109",
+        "138.25.209.111",
+        "138.25.209.112",
+        "138.25.209.113",
+        "138.25.209.120",
+        "138.25.209.121",
+        "138.25.209.122",
+        "138.25.209.123",
+        "138.25.209.124",
+        "138.25.209.125",
+        "138.25.209.126",
+        "138.25.209.127",
+        "138.25.209.128",
+        "138.25.209.129",
+        "138.25.209.130",
+        "138.25.209.131",
+        "138.25.209.132",
+        "138.25.209.203",
+        "138.25.209.206",
     )
+
+    def __post_init__(self):
+        self.camera_addresses = tuple(f"https://root:root@{ip}/mjpg/1/video.mjpg" for ip in self.camera_addresses)
 
     def get_raw_sources(self) -> tuple[str, ...]:
         source_maps = {
@@ -95,16 +98,16 @@ class SmartPlugConfig:
     password: str = "LTX4947978"
     timeout_seconds: int = 5
     alert_threshold: int = 50
-    devices: dict[str, str] = field(
-        default_factory=lambda: [
-            "192.168.0.185",
-            "192.168.0.198",
-            "192.168.0.102",
-            "192.168.0.195",
-            "192.168.0.130",
-            "192.168.0.164",
-            "192.168.0.110",
-        ]
+    device_maps: dict[str, str] = field(
+        default_factory=lambda: {
+            "192.168.0.185": [0, 1, 2, 3],
+            "192.168.0.198": [4, 5, 6, 7],
+            "192.168.0.102": [8, 9, 10, 11],
+            "192.168.0.195": [12, 13, 14, 15],
+            "192.168.0.130": [16, 17, 18, 19],
+            "192.168.0.164": [20, 21, 22, 23],
+            "192.168.0.110": [24, 25, 26, 27],
+        }
     )
 
 
