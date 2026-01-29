@@ -31,6 +31,9 @@ class SmartPlugHandler(BaseResultHandler):
         self.tapo_email = cfg.smart_plug.email
         self.tapo_password = cfg.smart_plug.password
 
+        self.timeout_seconds = cfg.smart_plug.timeout_seconds
+        self.alert_threshold = cfg.smart_plug.alert_threshold
+
         # Device Mapping: {'zone1': '192.168.1.100', 'zone2': '192.168.1.101'}
         self.device_ips: list[str] = cfg.smart_plug.devices
         self.sid_to_ip: dict[int, str] = {}
@@ -84,7 +87,7 @@ class SmartPlugHandler(BaseResultHandler):
         logger.info("[Plug] Resetting all devices to OFF...")
         for ip in self.device_ips:
             threading.Thread(
-                target=self._run_async_single_control,
+                target=self._control_one_device_task,
                 args=(ip, False),  # False = OFF
                 daemon=True,
                 name=f"Init-Reset-{ip}",
@@ -97,8 +100,6 @@ class SmartPlugHandler(BaseResultHandler):
         if not self.enable:
             return
 
-        THRESHOLD = 500  # Detection threshold
-
         # Step 1: Determine Target States for each IP
         # Default all to False (OFF)
         target_states = dict.fromkeys(self.device_ips, False)
@@ -106,7 +107,7 @@ class SmartPlugHandler(BaseResultHandler):
         # Iterate through detected streams
         for sid, count in zip(sids, counts):
             # Logic: Turn ON if count > threshold
-            if count > THRESHOLD:
+            if count > self.alert_threshold:
                 # Retrieve the IP associated with this stream ID
                 if sid in self.sid_to_ip:
                     target_ip = self.sid_to_ip[sid]
@@ -131,51 +132,47 @@ class SmartPlugHandler(BaseResultHandler):
             # B. Check if state change is needed
             if self.current_states.get(ip) != should_be_on:
                 threading.Thread(
-                    target=self._run_async_single_control,
+                    target=self._control_one_device_task,
                     args=(ip, should_be_on),
                     daemon=True,
                     name=f"Thread-Plug-{ip}",
                 ).start()
 
-    def _run_async_single_control(self, ip: str, turn_on: bool):
-        """
-        Thread entry point. Manages the 'busy' flag for a specific IP.
-        """
-        # 1. Mark Busy
-        with self.lock:
-            self.busy_ips.add(ip)
-
-        try:
-            # Run async control in this thread
-            asyncio.run(self._control_one_device_task(ip, turn_on))
-        except Exception as e:
-            logger.error(f"[Plug] Thread error for {ip}: {e}")
-        finally:
-            # 2. Unmark Busy
-            with self.lock:
-                if ip in self.busy_ips:
-                    self.busy_ips.remove(ip)
-
     async def _control_one_device_task(self, ip: str, turn_on: bool):
         """
-        Executes the Tapo API call.
+        Orchestrator: Wraps the execution with timeout protection and error handling.
         """
+        # Ensure timeout is defined (default to 3.0s if not set in __init__)
         try:
-            # Create fresh client for thread safety
-            client = ApiClient(self.tapo_email, self.tapo_password)
-            device = await client.p100(ip)
+            # CALL CHANGE: Directly await the new separate method with a timeout
+            await asyncio.wait_for(self._execute_device_command(ip, turn_on), timeout=self.timeout_seconds)
 
-            if turn_on:
-                await device.on()
-            else:
-                await device.off()
-
-            # Update state cache
+            # Update state cache upon success
             self.current_states[ip] = turn_on
 
             action = "ON" if turn_on else "OFF"
             logger.info(f"[Plug] Device {ip} switched {action}")
 
-        except Exception as e:
+        except asyncio.TimeoutError:
             # Warning level to avoid spamming logs on network timeout
+            logger.warning(f"[Plug] Timeout: Device {ip} unresponsive for {self.timeout_seconds}s.")
+
+        except Exception as e:
             logger.warning(f"[Plug] Failed to control {ip}: {e}")
+
+    async def _execute_device_command(self, ip: str, turn_on: bool):
+        """
+        Worker: Performs the actual Network I/O (Connect & Switch).
+        No try-except here; let errors bubble up to the caller.
+        """
+        # Create fresh client for thread safety (Crucial for asyncio isolation)
+        client = ApiClient(self.tapo_email, self.tapo_password)
+
+        # Connect to device (This step is usually where timeouts happen)
+        device = await client.p100(ip)
+
+        # Execute the switch command
+        if turn_on:
+            await device.on()
+        else:
+            await device.off()

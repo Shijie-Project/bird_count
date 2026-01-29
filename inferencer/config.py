@@ -75,7 +75,7 @@ class StreamConfig:
 
     # Buffer settings
     num_buffer: int = 4
-    enable_monitor: bool = False
+    enable_monitor: bool = True
 
     # Auto-calculated
     frame_interval_s: float = field(init=False)
@@ -93,6 +93,8 @@ class SmartPlugConfig:
     enable: bool = True
     email: str = "allenliu0416@163.com"
     password: str = "LTX4947978"
+    timeout_seconds: int = 5
+    alert_threshold: int = 50
     devices: dict[str, str] = field(
         default_factory=lambda: [
             "192.168.0.185",
