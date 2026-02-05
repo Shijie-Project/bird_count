@@ -112,7 +112,7 @@ class Scheduler:
 
             # FPS Control Logic
             next_slot = int(loop_start / self.cfg.stream.frame_interval_s) + 1
-            target_ts = next_slot * self.cfg.stream.frame_interval_s
+            target_ts = next_slot * self.cfg.stream.frame_interval_s + 0.005
 
             # Runtime Limit Check
             if self.cfg.stream.runtime_seconds and (loop_start - start_time > self.cfg.stream.runtime_seconds):

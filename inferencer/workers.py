@@ -132,7 +132,7 @@ class InferenceWorker:
         avg_frame_age_ms = sum([(wall_now - ts) for ts in task.timestamps]) / len(task.timestamps) * 1000
 
         log_msg = (
-            f"[Worker {self.worker_id}] Batch={len(task.sids)} | "
+            f"[Worker {self.worker_id}] Batch={task.sids} | "
             f"BufIdx={task.buffer_indices} | "
             f"FrameAge={avg_frame_age_ms:.1f}ms | "
             f"Q-Wait={queue_wait_ms:.1f}ms | "

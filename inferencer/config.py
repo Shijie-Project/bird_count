@@ -1,6 +1,5 @@
 import logging
 from dataclasses import dataclass, field
-from pprint import pformat
 from typing import Any, Literal, Optional
 
 import numpy as np
@@ -13,8 +12,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     path: str = "./ckpts/shufflenet_best_model_214800.pth"
-    input_h: int = 512
-    input_w: int = 512
+    input_w: int = 1080
+    input_h: int = 720
 
 
 @dataclass
@@ -30,6 +29,7 @@ class HardwareConfig:
 @dataclass
 class SourceConfig:
     mode: Literal["video", "rtsp", "camera"] = "camera"
+    timeout_seconds: int = 5
 
     video_paths: tuple[str, ...] = ("./data/bird_count_demo.mp4",)
     rtsp_urls: tuple[str, ...] = ("rtsp://127.0.0.1:8554/live/test",)
@@ -58,9 +58,6 @@ class SourceConfig:
         "138.25.209.206",
     )
 
-    def __post_init__(self):
-        self.camera_addresses = tuple(f"https://root:root@{ip}/mjpg/1/video.mjpg" for ip in self.camera_addresses)
-
     def get_raw_sources(self) -> tuple[str, ...]:
         source_maps = {
             "video": self.video_paths,
@@ -85,9 +82,9 @@ class StreamConfig:
 
     def __post_init__(self):
         # Clamp FPS Logic
-        if self.target_fps < 1 or self.target_fps > 60:
-            logger.warning(f"Clamping Target FPS {self.target_fps} to [1, 60].")
-        self.target_fps = max(1.0, min(60.0, self.target_fps))
+        if self.target_fps < 1 or self.target_fps > 30:
+            logger.warning(f"Clamping Target FPS {self.target_fps} to [1, 30].")
+        self.target_fps = max(1.0, min(30.0, self.target_fps))
         self.frame_interval_s = 1.0 / self.target_fps
 
 
@@ -98,15 +95,13 @@ class SmartPlugConfig:
     password: str = "LTX4947978"
     timeout_seconds: int = 5
     alert_threshold: int = 50
+    # IP addresses to the sid of each camera.
     device_maps: dict[str, str] = field(
         default_factory=lambda: {
-            "192.168.0.185": [0, 1, 2, 3],
-            "192.168.0.198": [4, 5, 6, 7],
-            "192.168.0.102": [8, 9, 10, 11],
-            "192.168.0.195": [12, 13, 14, 15],
-            "192.168.0.130": [16, 17, 18, 19],
-            "192.168.0.164": [20, 21, 22, 23],
-            "192.168.0.110": [24, 25, 26, 27],
+            "192.168.0.185": [0, 1, 2, 3, 4],
+            "192.168.0.198": [5, 6, 7, 8, 9],
+            "192.168.0.102": [10, 11, 12, 13, 14],
+            "192.168.0.195": [15, 16, 17, 18, 19],
         }
     )
 
@@ -138,7 +133,6 @@ class Config:
         logger.info(f"Streams: {self.stream.num_streams}")
         logger.info(f"GPUs: {len(self.hardware.available_gpus)}")
         logger.info(f"Workers: {self.hardware.total_workers}")
-        logger.info(f"Active Source(s):\n{pformat(self.active_stream_sources)}")
 
     @classmethod
     def from_settings(cls, envs: Any) -> "Config":

@@ -107,9 +107,29 @@ class MonitorHandler(BaseResultHandler):
                 # 移除后，右上角的 X 按钮会自动变灰禁用
                 ctypes.windll.user32.RemoveMenu(hmenu, 0xF060, 0x00000000)
 
-                logger.info(f"[UI] Close button (X) disabled for window: {self.window_name}")
+                logger.info(f"[Monitor] Close button (X) disabled for window: {self.window_name}")
         except Exception as e:
-            logger.warning(f"[UI] Failed to disable close button: {e}")
+            logger.warning(f"[Monitor] Failed to disable close button: {e}")
+
+    def _display(self):
+        if not self.is_window_setup:
+            # 第一次显示窗口
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            cv2.imshow(self.window_name, self.canvas)
+            cv2.waitKey(1)  # 必须先刷新一次，让窗口句柄生成
+
+            # 调用 Windows API 禁用 X 按钮
+            self._disable_window_close_button()
+
+            self.is_window_setup = True
+        else:
+            # 常规刷新
+            cv2.imshow(self.window_name, self.canvas)
+            cv2.waitKey(1)
+
+        if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+            if platform.system() != "Windows":
+                self.is_window_setup = False
 
     def handle(self, sids, processed_images, counts, timestamp):
         """
@@ -127,6 +147,9 @@ class MonitorHandler(BaseResultHandler):
             if sid >= self.num_streams:
                 continue  # Prevent out of bounds
 
+            y_slice, x_slice, coords = self.roi_map[sid]
+            x1, y1, x2, y2 = coords
+
             # Get current frame (RGB)
             img_rgb = processed_images[i]
 
@@ -137,16 +160,11 @@ class MonitorHandler(BaseResultHandler):
             # Resize to fit the tile (Resize is fast enough for small batches)
             # Interpolation can be LINEAR or NEAREST; NEAREST is fastest
             img_resized = cv2.resize(img_bgr, (self.tile_w, self.tile_h), interpolation=cv2.INTER_LINEAR)
-
-            y_slice, x_slice, coords = self.roi_map[sid]
-            x1, y1, x2, y2 = coords
-
             self.canvas[y_slice, x_slice] = img_resized
 
-            bar_height = 28
             label = f"CH-{sid:02d}: {int(counts[i])}"
 
-            cv2.rectangle(self.canvas, (x1, y1), (x1 + 90, y1 + bar_height), self.COLOR_BG_BAR, -1)
+            cv2.rectangle(self.canvas, (x1, y1), (x1 + 120, y1 + 28), self.COLOR_BG_BAR, -1)
             cv2.putText(self.canvas, label, (x1 + 5, y1 + 20), cv2.FONT_HERSHEY_DUPLEX, 0.6, self.COLOR_TEXT_ID, 1)
 
             cv2.rectangle(self.canvas, (x1, y1), (x2 - 1, y2 - 1), self.COLOR_GRID, 1)
@@ -154,30 +172,7 @@ class MonitorHandler(BaseResultHandler):
         # --- 5. Display ---
         # Note: imshow is quite time-consuming as it communicates with the Window Manager
         self._draw_grid_lines()
-
-        if not self.is_window_setup:
-            # 第一次显示窗口
-            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-            cv2.imshow(self.window_name, self.canvas)
-            cv2.waitKey(1)  # 必须先刷新一次，让窗口句柄生成
-
-            # 调用 Windows API 禁用 X 按钮
-            self._disable_window_close_button()
-
-            self.is_window_setup = True
-        else:
-            # 常规刷新
-            cv2.imshow(self.window_name, self.canvas)
-
-        cv2.imshow("Bird Count Monitor", self.canvas)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            logger.info("Exit signal received.")
-            raise KeyboardInterrupt("UI Exit")
-
-        if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
-            if platform.system() != "Windows":  # Windows 下 X 已经被禁用了，不需要这个逻辑
-                # 如果发现窗口不可见（被关了），下次循环重新创建
-                self.is_window_setup = False
+        self._display()
 
     def cleanup(self):
         if self.enable:

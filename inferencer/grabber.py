@@ -1,7 +1,6 @@
 import logging
 import multiprocessing as mp
 import multiprocessing.shared_memory as shm
-import re
 import threading
 import time
 
@@ -26,11 +25,7 @@ class FrameGrabber(threading.Thread):
         stop_event: threading.Event,
         cfg: Config,
     ) -> None:
-        pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
-        match = re.search(pattern, src)
-        self.ip = match.group(0) if match else src
-
-        super().__init__(daemon=True, name=f"grabber-{self.ip}")
+        super().__init__(daemon=True, name=f"grabber-{sid}")
         self.sid = sid
         self.src = src
         self.shm_frames_info = shm_frames_info
@@ -39,109 +34,109 @@ class FrameGrabber(threading.Thread):
         self.stop_event = stop_event
         self.cfg = cfg
 
+        self.timeout_seconds = cfg.source.timeout_seconds
+        self.input_h = cfg.model.input_h
+        self.input_w = cfg.model.input_w
         self._interval = cfg.stream.frame_interval_s
 
     def run(self) -> None:
-        # 1. Attach Video Frames SHM
         try:
+            # Attach Frames SHM
             existing_shm_frames = shm.SharedMemory(name=self.shm_frames_info.name)
             full_frames = np.ndarray(
                 self.shm_frames_info.shape, dtype=self.shm_frames_info.dtype, buffer=existing_shm_frames.buf
             )
             shm_frames = full_frames[self.sid]  # [NUM_BUFFER, H, W, 3]
-        except Exception as e:
-            logger.error(f"[Stream {self.ip}] Frames SHM attach failed: {e}")
-            return
 
-        # 2. Attach Metadata SHM
-        try:
+            # Attach Meta SHM
             existing_shm_meta = shm.SharedMemory(name=self.shm_meta_info.name)
             full_meta = np.ndarray(
                 self.shm_meta_info.shape, dtype=self.shm_meta_info.dtype, buffer=existing_shm_meta.buf
             )
             shm_meta = full_meta[self.sid]
+
         except Exception as e:
-            logger.error(f"[Stream {self.ip}] Meta SHM attach failed: {e}")
+            logger.error(f"[Stream {self.sid}] SHM attach failed: {e}")
             return
 
+        video_src = f"https://root:root@{self.src}/mjpg/1/video.mjpg" if self.cfg.source.mode == "camera" else self.src
+
+        error_frame = np.zeros((self.input_h, self.input_w, 3), dtype=np.uint8)
+
         while not self.stop_event.is_set():
-            cap = cv2.VideoCapture(self.src)
+            cap = cv2.VideoCapture(video_src)
+
             if not cap.isOpened():
-                logger.warning(f"[Stream {self.ip}] Connection failed. Retrying in 5s...")
-                time.sleep(5)
+                logger.warning(f"[Stream {self.sid}] Connection failed.")
+                cap.release()
+
+                self._pacing_write(error_frame, shm_frames, shm_meta)
+
+                time.sleep(self.timeout_seconds)
                 continue
 
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            logger.info(f"[Stream {self.ip}] Connected.")
+            logger.info(f"[Stream {self.sid}] Connected.")
+
             last_ok_time = time.time()
 
             while not self.stop_event.is_set():
                 if not cap.grab():
-                    if time.time() - last_ok_time > 5.0:
-                        logger.warning(f"[Stream {self.ip}] Timeout. Reconnecting...")
+                    if time.time() - last_ok_time > self.timeout_seconds:
+                        logger.warning(f"[Stream {self.sid}] Timeout. Reconnecting...")
                         break
-                    time.sleep(0.01)
+                    time.sleep(self._interval)
                     continue
 
                 last_ok_time = time.time()
-                next_slot = int(last_ok_time / self._interval) + 1
-                target_ts = next_slot * self._interval
 
                 ret, frame = cap.retrieve()
                 if not ret:
                     break
 
                 try:
-                    self.process_grabber_frame(frame, shm_frames, shm_meta)
+                    if frame.shape[:2] != (self.input_h, self.input_w):
+                        frame = cv2.resize(frame, (self.input_w, self.input_h))
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    wait = target_ts - time.time()
-                    if wait > 0:
-                        time.sleep(wait)
+                    self._pacing_write(frame, shm_frames, shm_meta)
 
                 except Exception as e:
-                    logger.error(f"[Stream {self.ip}] Process error: {e}")
+                    logger.error(f"[Stream {self.sid}] Process error: {e}")
                     break
 
             cap.release()
 
-    def process_grabber_frame(
-        self,
-        frame: np.ndarray,
-        shm_frames: np.ndarray,
-        shm_meta: np.ndarray,
-    ):
-        """
-        Core Grabber Logic:
-        1. Determine next buffer index.
-        2. Check lock state (Drop if locked).
-        3. Write data & update metadata.
-        """
-        # CPU Preprocessing
-        frame = cv2.resize(frame, (self.cfg.model.input_w, self.cfg.model.input_h))
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def _pacing_write(self, frame, shm_frames, shm_meta):
+        now = time.time()
+        next_slot = int(now / self._interval) + 1
+        target_ts = next_slot * self._interval
 
+        # 写入数据
+        self._write_frame_to_shm(frame, shm_frames, shm_meta)
+
+        wait = target_ts - time.time()
+        if wait > 0:
+            time.sleep(wait)
+
+    def _write_frame_to_shm(self, frame, shm_frames, shm_meta):
+        # Determine index
         current_idx = self.latest_cursor[self.sid]
         next_idx = (current_idx + 1) % self.cfg.stream.num_buffer
 
-        # 2. Check Buffer State
-        # 0.0 = Free, 2.0 = Ready (Overwritable), 1.0 = Locked (Protected)
-        state = shm_meta[next_idx, 0]
+        # Check Lock
+        if shm_meta[next_idx, 0] == 1.0:
+            logger.warning(f"[Stream {self.sid}] Buffer {next_idx} Locked. Dropping frame.")
+            return  # Drop if locked
 
-        if state == 1.0:
-            # [Flow Control] Target buffer is in use. Drop this frame.
-            logger.debug(f"[Stream {self.ip}] Buffer {next_idx} Locked. Dropping frame.")
-            return
-
-        # 3. Write Data (Zero Copy)
+        # Write Data
         np.copyto(shm_frames[next_idx], frame)
 
-        # 4. Update Metadata
-        # Mark as Ready (2.0)
+        # Update Metadata
         shm_meta[next_idx, 0] = 2.0
         shm_meta[next_idx, 1] = time.time()
 
-        # 5. Update Global Cursor
-        # Using lock ensures Scheduler reads consistent state if it checks concurrently
+        # 6. Update Cursor
         with self.latest_cursor.get_lock():
             self.latest_cursor[self.sid] = next_idx
 
