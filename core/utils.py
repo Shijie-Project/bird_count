@@ -18,10 +18,7 @@ def setup_logging(debug: bool = False) -> None:
     level = logging.DEBUG if debug else logging.INFO
 
     # Format optimized for parsing (e.g., by ELK stack or grep)
-    log_fmt = (
-        "%(asctime)s.%(msecs)03d | %(levelname)-8s | PID:%(process)-5d | "
-        "%(processName)-15s | %(name)-22s | %(message)s"
-    )
+    log_fmt = "%(asctime)s.%(msecs)03d | %(levelname)-8s | PID:%(process)-5d | %(processName)-15s |%(message)s"
     date_fmt = "%Y-%m-%d %H:%M:%S"
 
     logging.basicConfig(

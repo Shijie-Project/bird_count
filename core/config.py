@@ -1,9 +1,11 @@
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Literal, Optional
 
 import torch
+import yaml
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,8 +32,8 @@ class SharedMemoryConfig(BaseModel):
 
     # Resolution for Storage (What is saved in RAM)
     # Usually matches the Camera Source (e.g., 1080x720)
-    height: int = 720
     width: int = 1080
+    height: int = 720
     channels: int = 3
 
     @property
@@ -135,16 +137,16 @@ class Config:
         self.device = self._detect_device(envs.cuda_device)
 
         # 3. Topology Loading (The "Business Logic" of where cameras are)
-        # In a real industrial app, load this from `topology.yaml`
         self.zones = self._load_default_topology()
 
         # 4. Stream Reconciliation
         self.stream_sources = self._resolve_stream_sources()
         self.num_streams = len(self.stream_sources)
         self.num_buffers = self.shm.num_buffers
+        self.num_workers_per_gpu = envs.num_workers_per_gpu
 
         self.fps = envs.fps
-        self.num_workers_per_gpu = envs.num_workers_per_gpu
+        self.frame_interval = 1.0 / self.envs.fps
 
         self._log_configuration()
 
@@ -159,36 +161,20 @@ class Config:
 
     def _load_default_topology(self) -> tuple[ZoneConfig, ...]:
         """
-        Hardcoded default topology.
-        Refactored to be cleaner, but preserves original data.
+        Loads zone configuration from a YAML file.
         """
-        return (
-            ZoneConfig(
-                name="Zone_01_Right_Front",
-                cameras=["138.25.209.125", "138.25.209.122", "138.25.209.127", "138.25.209.123", "138.25.209.129"],
-                speakers=["138.25.209.236", "138.25.209.235", "138.25.209.231"],
-            ),
-            ZoneConfig(
-                name="Zone_02_Left_Front",
-                cameras=["138.25.209.112", "138.25.209.105", "138.25.209.130", "138.25.209.108", "138.25.209.126"],
-                speakers=["138.25.209.239", "138.25.209.240", "138.25.209.237"],
-            ),
-            ZoneConfig(
-                name="Zone_03_Right_Back",
-                cameras=["138.25.209.131", "138.25.209.109", "138.25.209.124", "138.25.209.120", "138.25.209.132"],
-                speakers=["138.25.209.234", "138.25.209.233", "138.25.209.232"],
-            ),
-            ZoneConfig(
-                name="Zone_04_Left_Back",
-                cameras=["138.25.209.104", "138.25.209.121", "138.25.209.113", "138.25.209.128", "138.25.209.111"],
-                speakers=["138.25.209.238"],
-            ),
-            ZoneConfig(
-                name="Zone_05_Right_Outer",
-                cameras=["138.25.209.206"],
-                speakers=["138.25.209.241"],
-            ),
-        )
+        yaml_path = Path(__file__).parents[1] / "topology.yaml"
+
+        try:
+            with open(yaml_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+
+            zones = [ZoneConfig(**z) for z in data.get("zones", [])]
+            logger.info(f"Successfully loaded {len(zones)} zones from {yaml_path}")
+            return tuple(zones)
+        except Exception as e:
+            logger.error(f"Failed to load YAML topology: {e}.")
+            sys.exit(1)
 
     def _resolve_stream_sources(self) -> tuple[str, ...]:
         """
@@ -205,7 +191,7 @@ class Config:
                 sources.extend([str(self.envs.demo_video_path)] * len(zone.cameras))
             else:
                 # Add RTSP prefixes
-                sources.extend([f"http://root:root@{ip}/mjpg/1/video.mjpg" for ip in zone.cameras])
+                sources.extend([f"http://root:root@{ip}/mjpg/1/video.mjpg" for ip in zone.cameras])  # noqa
 
         # Apply Global Limit (if set in .env)
         if self.envs.num_streams is not None:
@@ -219,42 +205,6 @@ class Config:
                 )
 
         return tuple(sources)
-
-    @property
-    def ip2id(self) -> dict[str, int]:
-        """
-        Creates a lookup table: Camera IP -> Stream ID.
-        Useful for reverse lookups when an external device (like a smart plug)
-        needs to know which stream it belongs to based on IP.
-        """
-        mapping = {}
-        current_stream_id = 0
-
-        for zone in self.zones:
-            for cam_ip in zone.cameras:
-                mapping[cam_ip] = current_stream_id
-                current_stream_id += 1
-
-        return mapping
-
-    @property
-    def id2ip(self) -> dict[int, str]:
-        """
-        Creates a lookup table: Stream ID -> Camera IP.
-        Useful for logging or displaying the source IP of a specific stream index.
-        """
-        mapping = {}
-        current_stream_id = 0
-
-        for zone in self.zones:
-            for cam_ip in zone.cameras:
-                mapping[current_stream_id] = cam_ip
-                current_stream_id += 1
-        return mapping
-
-    @property
-    def frame_interval(self) -> float:
-        return 1.0 / self.envs.fps
 
     def _log_configuration(self):
         logger.info("=" * 40)
@@ -287,11 +237,28 @@ class Config:
 
         logger.info("=" * 40)
 
+    @property
+    def sid_to_zone(self):
+        if hasattr(self, "_sid_to_zone"):
+            return self._sid_to_zone
+
+        sid = 0
+        sid_to_zone = {}
+        for zone in self.zones:
+            for _ in zone.cameras:
+                sid_to_zone[sid] = zone
+                sid += 1
+
+        self._sid_to_zone = sid_to_zone
+        return sid_to_zone
+
     @classmethod
     def load(cls, envs) -> "Config":
         """Factory method to load everything safely."""
         try:
-            return cls(envs)
+            config = cls(envs)
+            logger.info("Configuration Loaded Successfully.")
+            return config
         except Exception as e:
             logger.critical(f"Failed to load configuration: {e}")
-            raise
+            sys.exit(1)

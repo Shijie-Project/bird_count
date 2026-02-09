@@ -24,13 +24,7 @@ def main():
     except RuntimeError as e:
         logger.warning(f"Multiprocessing context already set: {e}")
 
-    try:
-        cfg = Config.load(envs)
-        logger.info("Configuration Loaded Successfully.")
-    except Exception as e:
-        logger.critical(f"Configuration Failed: {e}")
-        sys.exit(1)
-
+    cfg = Config.load(envs)
     dispatcher: Optional[TaskDispatcher] = None
 
     try:
