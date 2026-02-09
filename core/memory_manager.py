@@ -7,7 +7,6 @@ from typing import Optional
 import numpy as np
 
 
-# Setup logger
 logger = logging.getLogger(__name__)
 
 
@@ -21,17 +20,9 @@ class BufferState(IntEnum):
     WRITING = 1  # Grabber is currently writing (Lock).
     READY = 2  # Data is written, ready for Inference.
     READING = 3  # Inference is reading this slot (Lock).
-    # Note: After Inference, the slot goes back to FREE immediately
-    # if no strict sequencing is required for the Consumer,
-    # OR flows to CONSUMING if we want to hold the raw frame for the consumer.
-    # For this design, we assume Inference extracts data and releases buffer to FREE
-    # or keeps it READING until Consumer signals.
-    # Let's align with: Grabber -> Inference -> (Result Queue) -> Consumer.
-    # So SHM is mostly for Grabber -> Inference.
 
 
 # Define the exact memory layout for metadata to ensure alignment across processes.
-# Structure: [state (u8), stream_id (i32), buffer_idx (i32), timestamp (f64)]
 METADATA_DTYPE = np.dtype(
     [
         ("state", np.uint8),
@@ -58,12 +49,12 @@ class SharedMemoryConfig:
 
     @property
     def frame_size_mb(self) -> float:
-        """Calculate total size of the frame buffer in Megabytes (MB)."""
+        """Calculate the total size of the frame buffer in Megabytes (MB)."""
         return int(np.prod(self.shape) * np.dtype(self.dtype).itemsize) / (1024 * 1024)
 
     @property
     def meta_size_kb(self) -> float:
-        """Calculate total size of the metadata buffer in Kilobytes (KB)."""
+        """Calculate the total size of the metadata buffer in Kilobytes (KB)."""
         return int(np.prod(self.meta_shape) * METADATA_DTYPE.itemsize) / 1024.0
 
 
@@ -108,10 +99,14 @@ class SharedMemoryManager:
         try:
             self._allocate_memory()
             self._initialize_metadata()
-            logger.info(f"Allocated {self._config.frame_size_mb:.2f} MB for frames. (Shape: {self.shape})")
-            logger.info(f"Allocated {self._config.meta_size_kb:.2f} KB for metadata. (Shape: {self.meta_shape})")
+            logger.info(
+                f"[MemoryManager] Allocated {self._config.frame_size_mb:.2f} MB for frames. (Shape: {self.shape})"
+            )
+            logger.info(
+                f"[MemoryManager] Allocated {self._config.meta_size_kb:.2f} KB for metadata. (Shape: {self.meta_shape})"
+            )
         except Exception as e:
-            logger.error(f"Allocation failed: {e}")
+            logger.error(f"[MemoryManager] Allocation failed: {e}")
             self.cleanup()  # Attempt cleanup if partial fail
             raise e
 
@@ -158,11 +153,11 @@ class SharedMemoryManager:
             temp = shm.SharedMemory(name=name)
             temp.unlink()
             temp.close()
-            logger.warning(f"Found and unlinked orphaned buffer: {name}")
+            logger.warning(f"[MemoryManager] Found and unlinked orphaned buffer: {name}")
         except FileNotFoundError:
             pass  # Good, it doesn't exist
         except Exception as e:
-            logger.warning(f"Warning during unlink of {name}: {e}")
+            logger.warning(f"[MemoryManager] Warning during unlink of {name}: {e}")
 
     def cleanup(self):
         """Master process calls this to destroy memory blocks."""
@@ -170,17 +165,17 @@ class SharedMemoryManager:
             try:
                 self._shm.close()
                 self._shm.unlink()
-                logger.info("Frame buffer unlinked.")
+                logger.info("[MemoryManager] Frame buffer unlinked.")
             except Exception as e:
-                logger.error(f"Error cleaning frames: {e}")
+                logger.error(f"[MemoryManager] Error cleaning frames: {e}")
 
         if self._meta_shm:
             try:
                 self._meta_shm.close()
                 self._meta_shm.unlink()
-                logger.info("Metadata buffer unlinked.")
+                logger.info("[MemoryManager] Metadata buffer unlinked.")
             except Exception as e:
-                logger.error(f"Error cleaning meta: {e}")
+                logger.error(f"[MemoryManager] Error cleaning meta: {e}")
 
 
 class SharedMemoryClient:
@@ -204,14 +199,15 @@ class SharedMemoryClient:
             self.meta_shm = shm.SharedMemory(name=self.config.meta_name)
             self.metadata = np.ndarray(self.config.meta_shape, dtype=METADATA_DTYPE, buffer=self.meta_shm.buf)
 
-            logger.debug(f"Connected to {self.config.name}")
+            logger.debug(f"[MemoryClient] Connected to {self.config.name}")
         except Exception as e:
-            logger.critical(f"Failed to connect: {e}")
+            logger.critical(f"[MemoryClient] Failed to connect: {e}")
             raise e
 
-    def close(self):
+    def disconnect(self):
         """Detach without unlinking."""
         if self.shm:
             self.shm.close()
         if self.meta_shm:
             self.meta_shm.close()
+        logger.debug(f"[MemoryClient] Disconnected to {self.config.name}")

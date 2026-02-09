@@ -113,6 +113,8 @@ class EnvSettings(BaseSettings):
     enable_smart_plug: bool = True
     enable_speaker: bool = True
 
+    enable_trigger_gui: bool = True
+
     show_density_map: bool = True
 
     # Pydantic V2 config
@@ -248,9 +250,22 @@ class Config:
             for _ in zone.cameras:
                 sid_to_zone[sid] = zone
                 sid += 1
-
         self._sid_to_zone = sid_to_zone
         return sid_to_zone
+
+    @property
+    def sid_to_ip(self):
+        if hasattr(self, "_sid_to_ip"):
+            return self._sid_to_ip
+
+        sid = 0
+        sid_to_ip = {}
+        for zone in self.zones:
+            for ip in zone.cameras:
+                sid_to_ip[sid] = ip
+                sid += 1
+        self._sid_to_ip = sid_to_ip
+        return sid_to_ip
 
     @classmethod
     def load(cls, envs) -> "Config":
