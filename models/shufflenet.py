@@ -110,7 +110,7 @@ class ShuffleNetDensityNet(nn.Module):
 
 
 def get_shufflenet_density_model(
-    model_path: Optional[str] = None, device: str = "cpu", inference: bool = False
+    model_path: Optional[str] = None, device: str | torch.device = "cpu", fuse: bool = False
 ) -> nn.Module:
     """
     Factory function to create, load, and optimize the ShuffleNetDensityNet.
@@ -156,19 +156,54 @@ def get_shufflenet_density_model(
     model.eval()
     model.to(device)
 
-    if inference:
+    if fuse:
         model.fuse_model()
 
     return model
 
 
-if __name__ == "__main__":
-    # Sanity Check Block
-    model = get_shufflenet_density_model()
-    dummy_input = torch.randn(2, 3, 224, 224)
-    mu = model(dummy_input)
+def export_to_onnx(model_path, onnx_output_path, device="cuda"):
+    # 1. Initialize and load the model
+    # We set fuse=True to simplify the graph before exporting
+    model = get_shufflenet_density_model(model_path=model_path, device=device, fuse=True)
+    model.eval()
 
-    print(f"Input shape: {dummy_input.shape}")
-    print(f"Density Map shape: {mu.shape}")  # Expected: [2, 1, 28, 28] (1/8 size)
-    print(f"Check Non-negative: {mu.min() >= 0}")
-    print("Model build successful.")
+    # 2. Define dummy input
+    # Standard size is usually 224x224, but ensure it matches your inference size
+    batch_size = 1
+    dummy_input = torch.randn(batch_size, 3, 720, 1080).to(device)
+
+    # 3. Export to ONNX
+    logger.info(f"Exporting model to {onnx_output_path}...")
+
+    try:
+        torch.onnx.export(
+            model,  # Model being run
+            dummy_input,  # Model input (or a tuple for multiple inputs)
+            onnx_output_path,  # Where to save the model
+            export_params=True,  # Store the trained parameter weights inside the model file
+            opset_version=11,  # The ONNX version to export the model to (11+ recommended)
+            do_constant_folding=True,  # Whether to execute constant folding for optimization
+            input_names=["input"],  # The model's input names
+            output_names=["output"],  # The model's output names
+            # Enable dynamic axes for variable batch size or resolutions
+            dynamic_axes={
+                "input": {0: "batch_size", 2: "height", 3: "width"},
+                "output": {0: "batch_size", 2: "out_height", 3: "out_width"},
+            },
+        )
+        logger.info("ONNX export complete.")
+    except Exception as e:
+        logger.error(f"ONNX export failed: {e}")
+
+
+if __name__ == "__main__":
+    CHECKPOINT = "./ckpts/shufflenet_best_model_214800.pth"
+    OUTPUT_ONNX = "./ckpts/shufflenet_best_model_214800.onnx"
+    export_to_onnx(CHECKPOINT, OUTPUT_ONNX)
+
+    import onnx
+
+    model = onnx.load(OUTPUT_ONNX)
+    onnx.checker.check_model(model)
+    print("ONNX Model check passed!")

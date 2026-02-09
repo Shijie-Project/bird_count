@@ -1,11 +1,13 @@
 import asyncio
 import logging
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+
+import numpy as np
 
 from ..config import Config
-from .base import BaseHandler, BatchInferenceResult
+from .base import BaseHandler, InferenceResult
 
 
 # Make this optional to prevent crash if library missing
@@ -19,18 +21,20 @@ logger = logging.getLogger(__name__)
 
 class SmartPlugHandler(BaseHandler):
     """
-    Industrial Handler for IoT Plugs (TP-Link Tapo) based on Zone Config.
-    Trigger logic:
-    If ANY camera in a Zone exceeds the Zone's threshold -> Turn ON that Zone's Plug.
+    Optimized Industrial Handler for IoT Plugs (TP-Link Tapo).
+
+    Trigger Logic:
+    - Responds directly to 'alert_flag' from InferenceResult.
+    - Turns ON assigned plugs when an alert is detected.
+    - Stays in 'ACTIVE' state until the plug is MANUALLY turned off.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, name="SmartPlug"):
+        super().__init__(name=name, needs_frames=False)
         self.enable = config.envs.enable_smart_plug
-        if not self.enable:
-            return
-
-        if ApiClient is None:
-            logger.error("'tapo' library not installed. Handler disabled.")
+        if not self.enable or ApiClient is None:
+            if ApiClient is None and self.enable:
+                logger.error(f"[{self.name}] 'tapo' library not installed. SmartPlugHandler disabled.")
             self.enable = False
             return
 
@@ -39,126 +43,83 @@ class SmartPlugHandler(BaseHandler):
 
         # 1. Map Stream ID -> {IPs, Threshold}
         # Note: One stream can trigger MULTIPLE plugs if configured in the zone.
-        self.stream_map = {}
-        unique_ips = set()
+        self.stream_to_plugs: dict[int, set[str]] = {sid: zone.smart_plugs for sid, zone in config.sid_to_zone.items()}
 
-        for zone in getattr(config, "zones", []):
-            plug_ips = getattr(zone, "smart_plugs", [])
-            if not plug_ips:
-                continue
+        all_unique_ips = {ip for ips in self.stream_to_plugs.values() for ip in ips}
+        self.device_states: dict[str, str] = dict.fromkeys(all_unique_ips, "READY")
 
-            # Ensure we track all unique IPs for state management
-            unique_ips |= set(plug_ips)
+        self._executor = None
+        logger.info(f"[{self.name}] Initialized with {len(all_unique_ips)} unique devices.")
 
-            # Map each camera in this zone to these plugs
-            for cam_ip in getattr(zone, "cameras", []):
-                sid = config.ip2id[cam_ip]
-                self.stream_map[sid] = {"ips": plug_ips, "threshold": zone.threshold}
+    @property
+    def executor(self):
+        """Initialize the thread pool only after the process starts."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=max(1, len(self.device_states)), thread_name_prefix=self.name
+            )
+        return self._executor
 
-        if not self.stream_map:
-            logger.warning("[SmartPlug] Enabled but no smart plugs configured in Zones.")
-            self.enable = False
+    def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
+        """
+        Processes a single result.
+        Note: Frame is always None here because needs_frames=False.
+        """
+        # OPTIMIZATION 2: Directly trust the alert_flag calculated by ResultProcess.
+        if not result.alert_flag:
             return
 
-        # 2. State Management
-        # Device States: 'READY', 'ACTIVE'
-        self.device_states = dict.fromkeys(unique_ips, "READY")
-        self.state_lock = threading.Lock()
-
-        # 3. Worker Pool
-        self.executor = ThreadPoolExecutor(max_workers=max(1, len(unique_ips)), thread_name_prefix="PlugWorker")
-        logger.info(f"[SmartPlug] Initialized. Controlling {len(unique_ips)} devices.")
-
-    def handle_batch(self, batch_result: BatchInferenceResult, shm_client=None):
-        """
-        Check batch results against zone thresholds.
-        """
-        if not self.enable or batch_result is None:
-            return
-
-        ips_to_trigger = set()
-
-        for res in batch_result.results:
-            sid = res.stream_id
-
-            if sid not in self.stream_map:
-                continue
-
-            zone_info = self.stream_map[sid]
-
-            # Check Threshold
-            if res.count >= zone_info["threshold"]:
-                for ip in zone_info["ips"]:
-                    # Optimization: Peek state without lock first
-                    if self.device_states.get(ip) == "READY":
-                        ips_to_trigger.add(ip)
-                        # logger.debug(f"Trigger condition met on Stream {sid} for Plug {ip}")
-
-        # Execute triggers
-        for ip in ips_to_trigger:
-            self._trigger_if_ready(ip)
-
-    def handle(self, result, frame):
-        """Legacy interface stub."""
-        pass
-
-    def _trigger_if_ready(self, ip: str):
-        """Thread-safe trigger logic."""
-        trigger = False
-        with self.state_lock:
-            if self.device_states[ip] == "READY":
+        target_ips = self.stream_to_plugs.get(result.stream_id, [])
+        for ip in target_ips:
+            # Quick check without lock to reduce overhead
+            if self.device_states.get(ip) == "READY":
                 self.device_states[ip] = "ACTIVE"
-                trigger = True
-
-        if trigger:
-            logger.info(f"[SmartPlug] Triggering sequence for {ip}...")
-            self.executor.submit(self._run_lifecycle, ip)
+                self.executor.submit(self._run_lifecycle, ip)
 
     def _run_lifecycle(self, ip: str):
-        """Wrapper to run async code in thread."""
+        """Runs the async monitoring task in a dedicated thread."""
         try:
             asyncio.run(self._async_task(ip))
         except Exception as e:
-            logger.error(f"[SmartPlug] Lifecycle failed for {ip}: {e}")
+            logger.error(f"[{self.name}] Task failed for {ip}: {e}")
         finally:
-            # Always reset state when done (even if error)
-            with self.state_lock:
-                self.device_states[ip] = "READY"
-                logger.info(f"[SmartPlug] {ip} cycle finished. Reset to READY.")
+            # Reset state back to READY so it can be triggered again later
+            self.device_states[ip] = "READY"
+            logger.debug(f"[{self.name}] {ip} reset to READY state.")
 
     async def _async_task(self, ip: str):
-        """Async sequence: ON -> Monitor -> Finish"""
+        """
+        Async Logic: Turn ON -> Poll until MANUALLY turned off -> Exit.
+        """
         client = ApiClient(self.auth_email, self.auth_password)
         try:
             device = await client.p100(ip)
 
-            # A. Turn ON
-            # logger.info(f"[SmartPlug] Sending ON command to {ip}...")
+            # Step A: Turn ON the device
             await asyncio.wait_for(device.on(), timeout=10.0)
+            logger.info(f"[{self.name}] {ip} is now ON.")
 
-            # B. Monitoring Loop (Wait for manual turn off)
-            logger.info(f"[SmartPlug] {ip} is ON. Monitoring for manual shutdown...")
+            # Step B: Wait for manual shutdown
+            # We check the state periodically. The loop exits when a human turns it off.
+            max_idle_time = 3600  # Safety timeout (1 hour)
+            start_time = time.time()
 
-            monitor_start = time.time()
-            max_monitor_time = 3600  # 1 Hour Safety Timeout
-
-            while (time.time() - monitor_start) < max_monitor_time:
-                await asyncio.sleep(5.0)  # Check every 5s
+            while (time.time() - start_time) < max_idle_time:
+                await asyncio.sleep(5.0)  # Check every 5 seconds
 
                 try:
                     info = await asyncio.wait_for(device.get_device_info(), timeout=5.0)
                     if not info.device_on:
-                        logger.info(f"[SmartPlug] Manual shutdown detected on {ip}.")
+                        logger.info(f"[{self.name}] Manual shutdown detected on {ip}. Task complete.")
                         break
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.warning(f"[SmartPlug] Status check warning {ip}: {e}")
-                    await asyncio.sleep(5.0)
+                except Exception:
+                    continue  # Ignore transient network issues during monitoring
 
         except Exception as e:
-            logger.error(f"[SmartPlug] Async error on {ip}: {e}")
+            logger.error(f"[{self.name}] Async error on {ip}: {e}")
 
     def stop(self):
+        """Shuts down the worker pool."""
         if self.enable:
             self.executor.shutdown(wait=False)
+            logger.info(f"[{self.name}] Handler stopped.")

@@ -1,13 +1,10 @@
 import logging
 import multiprocessing as mp
 import queue
-import time
-from dataclasses import replace
-from typing import Optional
 
 from .config import Config
-from .handlers import BaseHandler, init_handlers
-from .inference_process import BatchInferenceResult, InferenceResult
+from .handlers import BaseHandler
+from .inference_process import BatchInferenceResult
 from .memory_manager import BufferState, SharedMemoryClient, SharedMemoryConfig
 from .utils import setup_logging
 
@@ -17,9 +14,8 @@ logger = logging.getLogger(__name__)
 
 class ResultProcess(mp.Process):
     """
-    The Final Destination.
-    Consumes results, evaluates business logic (thresholds),
-    and dispatches processed data to handlers.
+    High-throughput Result Consumer.
+    Evaluates thresholds, triggers alerts, and manages the SHM lifecycle.
     """
 
     def __init__(self, config: Config, shm_config: SharedMemoryConfig, result_queue: mp.Queue):
@@ -30,103 +26,110 @@ class ResultProcess(mp.Process):
         self._stop_event = mp.Event()
         self.handlers: list[BaseHandler] = []
 
-        # Pre-calculate threshold mapping: stream_id -> threshold
-        # This ensures O(1) lookup performance during high-speed inference
-        self.stream_thresholds = {sid: zone.threshold for sid, zone in self.config.sid_to_zone.items()}
+        # O(1) Threshold Mapping
+        self.stream_thresholds: dict[int, float] = {
+            sid: zone.threshold for sid, zone in self.config.sid_to_zone.items()
+        }
 
-    def register_handlers(self):
-        """Add a plugin to process results."""
-        handlers = init_handlers(self.config)
-        for handler in handlers:
-            self.handlers.append(handler)
+        self.manual_override_streams: set[int] = set()
+
+    def register_handler(self, handler: BaseHandler):
+        """Registers a plugin to process finalized results."""
+        self.handlers.append(handler)
 
     def _handle_manual_trigger(self, stream_id: int):
-        """Callback for the GUI class to inject a mock alert."""
-        logger.info(f"[ResultProcess] Manual trigger activated for stream {stream_id}")
+        """Callback for GUI to inject manual alerts."""
+        if stream_id in self.manual_override_streams:
+            self.manual_override_streams.remove(stream_id)
+            logger.info(f"[{self.name}] Manual Hijack DISABLED for Stream {stream_id}.")
+        else:
+            self.manual_override_streams.add(stream_id)
+            logger.info(f"[{self.name}] Manual Hijack ENABLED for Stream {stream_id}. Forcing all alerts to True.")
 
-        # Create a mock result that bypasses normal threshold checks
-        mock_res = InferenceResult(
-            stream_id=stream_id,
-            buffer_idx=-1,  # -1 indicates no physical SHM buffer
-            frame_idx=-1,
-            timestamp=time.time(),
-            count=99.0,  # Arbitrary high count
-            latency=0.0,
-            alert_flag=True,  # Force the alert flag to True
-        )
-
-        batch = BatchInferenceResult(results=[mock_res])
-
-        # Dispatch to all handlers
-        for handler in self.handlers:
-            try:
-                # Note: shm_client is passed as None because there is no frame for manual trigger
-                handler.handle_batch(batch, None)  # type: ignore
-            except Exception as e:
-                logger.error(f"[ResultProcess] Manual trigger handler error: {e}")
-
-    def _evaluate_alert(self, batch_packet: BatchInferenceResult):
-        """Evaluates bird count thresholds for each result in the batch and updates alert flags."""
-        new_results = []
+    def _evaluate_alerts_inplace(self, batch_packet: BatchInferenceResult):
+        """
+        Fast in-place alert evaluation.
+        Avoids creating new objects to reduce GC pressure.
+        """
         for result in batch_packet.results:
-            threshold = self.stream_thresholds.get(result.stream_id, 0)
-            new_result = replace(result, alert_flag=result.count >= threshold)
-            new_results.append(new_result)
-        batch_packet.results = new_results
+            # 1. Check if this stream is currently being hijacked
+            if result.stream_id in self.manual_override_streams:
+                result.alert_flag = True
+                # logger.debug(f"Stream {result.stream_id} is hijacked. Forcing alert_flag=True")
+                continue  # Skip normal threshold logic for hijacked streams
+
+            # 2. Normal Threshold Logic
+            threshold = self.stream_thresholds.get(result.stream_id, 0.0)
+            result.alert_flag = result.count >= threshold
 
     def run(self):
+        """Main consumption loop."""
         setup_logging(self.config.envs.debug)
-        logger.info("[ResultProcess] Started.")
+        logger.info(f"[{self.name}] Process Started.")
 
-        # Attach to Shared Memory
+        # 1. Resource Setup
         shm_client = SharedMemoryClient(self.shm_config)
         shm_client.connect()
 
-        # Start Handlers
         for h in self.handlers:
             h.start()
 
-        # Initialize GUI Class if enabled
-        gui: Optional["ManualTriggerGUI"] = None
+        # 2. Optional GUI Setup
+        gui = None
         if self.config.envs.enable_trigger_gui:
-            from .gui import ManualTriggerGUI
+            try:
+                from .gui import ManualTriggerGUI
 
-            gui = ManualTriggerGUI(self.config, self._handle_manual_trigger)
-            gui.setup()
+                # The callback now toggles the 'hijack' state in this process
+                gui = ManualTriggerGUI(self.config, self._handle_manual_trigger)
+                gui.setup()
+            except ImportError:
+                logger.warning(f"[{self.name}] GUI requested but .gui module not found.")
 
-        # 2. Consumption Loop
+        # 3. Consumption Loop
         while not self._stop_event.is_set():
             if gui:
                 gui.update()
 
             try:
-                # [Batch Mode] Get the whole packet
+                # Use a small timeout to allow checking the stop_event
                 batch_packet: BatchInferenceResult = self.result_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
 
             try:
-                self._evaluate_alert(batch_packet)
+                # A. Logical Evaluation (In-place)
+                self._evaluate_alerts_inplace(batch_packet)
 
+                # B. Plugin Dispatch
                 for handler in self.handlers:
                     try:
                         handler.handle_batch(batch_packet, shm_client)
                     except Exception as e:
-                        logger.error(f"[ResultProcess] Handler {type(handler).__name__} batch error: {e}")
+                        logger.error(f"[{self.name}] Handler {type(handler).__name__} error: {e}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Unexpected loop error: {e}")
 
             finally:
-                # --- 4. Critical: Batch Release ---
-                shm_client.metadata[batch_packet.stream_ids, batch_packet.buffer_indices]["state"] = BufferState.FREE
+                # C. CRITICAL: Atomic SHM Release
+                # We extract indices only once for performance
+                sids = batch_packet.stream_ids
+                b_idxs = batch_packet.buffer_indices
 
-        # 5. Cleanup
+                # Check for -1 (manual triggers) to avoid indexing errors
+                if b_idxs and b_idxs[0] != -1:
+                    shm_client.metadata[sids, b_idxs]["state"] = BufferState.FREE
+
+        # 4. Cleanup Sequence
         if gui:
             gui.destroy()
 
         for h in self.handlers:
             h.stop()
 
-        shm_client.close()
-        logger.info("[ResultProcess] Exited.")
+        shm_client.disconnect()
+        logger.info(f"[{self.name}] Stopped.")
 
     def stop(self):
         self._stop_event.set()

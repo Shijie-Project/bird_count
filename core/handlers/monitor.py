@@ -1,6 +1,8 @@
 import logging
 import math
+import multiprocessing as mp
 import platform
+import queue
 import time
 from typing import Optional
 
@@ -8,52 +10,113 @@ import cv2
 import numpy as np
 
 from ..config import Config
-from .base import BaseHandler, BatchInferenceResult, InferenceResult, SharedMemoryClient
+from ..memory_manager import SharedMemoryClient, SharedMemoryConfig
+from .base import BaseHandler, BatchInferenceResult, InferenceResult
 
 
 logger = logging.getLogger(__name__)
 
 
-class MonitorHandler(BaseHandler):
+class _InternalMonitorRenderer:
     """
-    Real-time Visualization Dashboard.
-    Updates individual tiles on a unified canvas as results arrive.
+    Actual rendering logic that runs in the dedicated DisplayProcess.
     """
 
-    # --- Style Config ---
+    # --- Style Config (Static constants for cache efficiency) ---
     COLOR_GRID = (50, 50, 50)
     COLOR_BG_BAR = (0, 0, 0)
-    COLOR_TEXT_NORMAL = (0, 255, 0)  # Green
-    COLOR_TEXT_ALERT = (255, 255, 255)  # White
-    COLOR_BG_ALERT = (0, 0, 255)  # Red
+    COLOR_TEXT_NORMAL = (0, 255, 0)
+    COLOR_TEXT_ALERT = (255, 255, 255)
+    COLOR_BG_ALERT = (0, 0, 255)
 
     FONT = cv2.FONT_HERSHEY_DUPLEX
     FONT_SCALE = 0.6
     FONT_THICKNESS = 1
 
-    # Target display resolution (Full HD)
+    # Target display resolution
     SCREEN_W, SCREEN_H = 1920, 1080
 
-    def __init__(self, config: Config):
-        self.window_name = "Bird Detection Dashboard"
+    def __init__(self, config: Config, window_name="Bird Detection Dashboard", name="Monitor"):
+        self.rgb_to_bgr = config.envs.show_density_map
+        self.window_name = window_name
+        self.name = name
         self.num_streams = config.num_streams
         self.is_window_setup = False
 
-        # 1. Threshold Configuration (Zone-based)
-        self.stream_thresholds = {}
+        self._last_ui_update = 0
+        self._ui_update_interval = 1.0 / 25.0
 
-        # Parse Zones to build the map
-        for zone in getattr(config, "zones", []):
-            # Get threshold for this zone (fallback to global if not set in zone)
-            for cam_ip in getattr(zone, "cameras", []):
-                self.stream_thresholds[config.ip2id[cam_ip]] = zone.threshold
+        # Layout calculation
+        self.cols = int(math.ceil(math.sqrt(self.num_streams)))
+        self.rows = int(math.ceil(self.num_streams / self.cols))
+        self.tile_w = self.SCREEN_W // self.cols
+        self.tile_h = self.SCREEN_H // self.rows
 
-        # 2. Prepare UI Layout
-        self._setup_layout()
-        self._init_canvas()
+        self.canvas = np.zeros((self.rows * self.tile_h, self.cols * self.tile_w, 3), dtype=np.uint8)
+        self.roi_map = [
+            (
+                (slice(r * self.tile_h, (r + 1) * self.tile_h), slice(c * self.tile_w, (c + 1) * self.tile_w)),
+                (c * self.tile_w, r * self.tile_h, (c + 1) * self.tile_w, (r + 1) * self.tile_h),
+            )
+            for i in range(self.num_streams)
+            for r, c in [divmod(i, self.cols)]
+        ]
 
-    def start(self):
-        logger.info("Monitor Initialized.")
+    def render_batch(self, batch: BatchInferenceResult, shm_client: SharedMemoryClient):
+        now = time.time()
+        # Update canvas
+        for res in batch.results:
+            sid = res.stream_id
+            if sid >= len(self.roi_map):
+                continue
+
+            slices, coords = self.roi_map[sid]
+            # Zero-copy fetch from SHM
+            frame = shm_client.frames[sid, res.buffer_idx]
+            resized = cv2.resize(frame, (self.tile_w, self.tile_h))
+            if self.rgb_to_bgr:
+                resized = resized[..., ::-1]
+
+            # Fast RGB to BGR flip
+            self.canvas[slices[0], slices[1]] = resized
+            self._draw_overlay(res, coords)
+
+        # Throttled Window Refresh
+        if now - self._last_ui_update >= self._ui_update_interval:
+            if not self.is_window_setup:
+                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                self._disable_window_close_button()
+                self.is_window_setup = True
+
+            cv2.imshow(self.window_name, self.canvas)
+            cv2.waitKey(1)
+            self._last_ui_update = now
+
+    def _draw_overlay(self, res: InferenceResult, coords: tuple):
+        x1, y1, x2, y2 = coords
+        flash_on = int(time.time() * 4) & 1 == 0
+
+        if res.alert_flag and flash_on:
+            bg_color, text_color, border_color, thick = (
+                self.COLOR_BG_ALERT,
+                self.COLOR_TEXT_ALERT,
+                self.COLOR_BG_ALERT,
+                3,
+            )
+        else:
+            bg_color, text_color, border_color, thick = self.COLOR_BG_BAR, self.COLOR_TEXT_NORMAL, self.COLOR_GRID, 1
+
+        # Header bar
+        cv2.rectangle(self.canvas, (x1, y1), (x1 + 120, y1 + 30), bg_color, -1)
+
+        # Label Text
+        label = f"CAM {res.stream_id}: {int(res.count)}"
+        cv2.putText(
+            self.canvas, label, (x1 + 10, y1 + 15), self.FONT, self.FONT_SCALE, text_color, self.FONT_THICKNESS
+        )
+
+        # Tile Border
+        cv2.rectangle(self.canvas, (x1, y1), (x2, y2), border_color, thick)
 
     def _disable_window_close_button(self):
         if platform.system() != "Windows":
@@ -69,136 +132,67 @@ class MonitorHandler(BaseHandler):
                 ctypes.windll.user32.RemoveMenu(hmenu, 0xF060, 0x00000000)  # noqa
                 logger.info(f"[Monitor] Close button (X) disabled for window: {self.window_name}")
         except Exception as e:
-            logger.warning(f"[Monitor] Failed to disable close button: {e}")
+            logger.warning(f"[{self.name}] Failed to disable close button: {e}")
 
-    def _setup_layout(self):
-        """Calculate grid positions, tile sizes and ROI map."""
-        # Calculate optimal grid (rows x cols)
-        if self.num_streams == 0:
-            self.cols, self.rows = 1, 1
-        else:
-            self.cols = int(math.ceil(math.sqrt(self.num_streams)))
-            self.rows = int(math.ceil(self.num_streams / self.cols))
 
-        self.tile_w = self.SCREEN_W // self.cols
-        self.tile_h = self.SCREEN_H // self.rows
+class DisplayProcess(mp.Process):
+    def __init__(self, config, shm_config, display_queue):
+        super().__init__(name="Monitor", daemon=True)
+        self.config = config
+        self.shm_config = shm_config
+        self.display_queue = display_queue
 
-        # Pre-calculate Slice objects for fast numpy indexing
-        # ROI structure: List of (slice_y, slice_x, (x1, y1, x2, y2))
-        self.roi_map = []
-        for i in range(self.num_streams):
-            r, c = divmod(i, self.cols)
-            x1, y1 = c * self.tile_w, r * self.tile_h
-            x2, y2 = x1 + self.tile_w, y1 + self.tile_h
-            self.roi_map.append((slice(y1, y2), slice(x1, x2), (x1, y1, x2, y2)))
+    def run(self):
+        # Only import and connect within the child process
+        shm_client = SharedMemoryClient(self.shm_config)
+        shm_client.connect()
+        renderer = _InternalMonitorRenderer(self.config)
+        logger.info(f"[{self.name}] Display Process started.")
 
-    def _init_canvas(self):
-        """Create the black background canvas."""
-        # Pre-allocate memory for the dashboard
-        self.canvas = np.zeros((self.rows * self.tile_h, self.cols * self.tile_w, 3), dtype=np.uint8)
+        while True:
+            try:
+                batch = self.display_queue.get(timeout=1.0)
+                renderer.render_batch(batch, shm_client)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"[{self.name}] Render error: {e}")
 
-    def handle_batch(self, batch_result: Optional[BatchInferenceResult], shm_client: SharedMemoryClient):
-        """
-        [Optimized] Process updates in bulk and refresh window ONCE.
-        """
-        updated = False
 
-        # 1. Update Canvas (Memory Operations)
-        for result in batch_result.results:
-            # Direct read from SHM
-            raw_frame = shm_client.frames[result.stream_id, result.buffer_idx]
+class MonitorHandler(BaseHandler):
+    """
+    Proxy Handler that looks like a normal handler but runs
+    the heavy UI in a separate process.
+    """
 
-            # Update the tile
-            success = self.handle(result, raw_frame)
-            if success:
-                updated = True
+    def __init__(self, config: Config, shm_config: SharedMemoryConfig, name="Monitor"):
+        super().__init__(name=name, needs_frames=False)
+        self.config = config
+        self.shm_config = shm_config
+        self.display_queue: Optional[mp.Queue] = None
+        self.proc: Optional[mp.Process] = None
 
-        # 2. Refresh Window (GUI Operation - Expensive)
-        # Only do this once per batch!
-        if updated:
-            if not self.is_window_setup:
-                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-                self._disable_window_close_button()
-                self.is_window_setup = True
+    def start(self):
+        self.display_queue = mp.Queue(maxsize=5)
 
-            cv2.imshow(self.window_name, self.canvas)
-            cv2.waitKey(1)
+        self.proc = DisplayProcess(self.config, self.shm_config, self.display_queue)
+        self.proc.start()
 
-    def handle(self, result: InferenceResult, frame: np.ndarray) -> bool:
-        """
-        Updates the specific tile for the incoming stream ID.
-        Returns True if update was successful.
-        """
-        sid = result.stream_id
-        if sid >= len(self.roi_map):
-            return False
+        logger.info("[Monitor] Background display process started.")
 
-        # 1. Get ROI coordinates
-        y_slice, x_slice, coords = self.roi_map[sid]
+    def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
+        # This is skipped because we override handle_batch
+        pass
 
-        # 2. Process Image (Resize & Copy)
-        try:
-            # Resize directly into the canvas slot
-            # Note: frame is usually RGB (since we converted it in InferenceProcess or it came as RGB).
-            # But OpenCV imshow expects BGR.
-            # If your Inference Engine writes RGB overlay, convert here.
-            # If your Inference Engine writes BGR, remove conversion.
-            # Assuming standard pipeline: Inference writes BGR or RGB based on previous steps.
-            # Let's assume input 'frame' is BGR for OpenCV compatibility (standard).
-
-            resized_frame = cv2.resize(frame, (self.tile_w, self.tile_h), interpolation=cv2.INTER_LINEAR)
-
-            # If the source is RGB (e.g. from PIL/Torch), swap to BGR for imshow
-            self.canvas[y_slice, x_slice] = cv2.cvtColor(resized_frame, cv2.COLOR_RGB2BGR)
-
-        except Exception as e:
-            logger.error(f"[Monitor] Resize failed for stream {sid}: {e}")
-            return False
-
-        # 3. Draw Overlay (In-place on canvas)
-        self._draw_overlay(sid, result.count, coords)
-
-        return True
-
-    def _draw_overlay(self, sid: int, count: float, coords: tuple):
-        """Draws the header bar, text, and alerts based on Zone Thresholds."""
-        x1, y1, x2, y2 = coords
-
-        # 1. Determine Threshold for this specific camera
-        threshold = self.stream_thresholds[sid]
-
-        # 2. Check Alert Status
-        is_alert = count >= threshold
-        flash_on = int(time.time() * 4) % 2 == 0
-
-        if is_alert and flash_on:
-            bg_color = self.COLOR_BG_ALERT
-            text_color = self.COLOR_TEXT_ALERT
-            border_color = self.COLOR_BG_ALERT
-            border_thick = 3
-        else:
-            bg_color = self.COLOR_BG_BAR
-            text_color = self.COLOR_TEXT_NORMAL
-            border_color = self.COLOR_GRID
-            border_thick = 1
-
-        # 3. Format Label (Show current / threshold)
-        # Example: "CAM 0: 15 / 10"
-        label = f"CAM {sid}: {int(count)} / {int(threshold)}"
-
-        # 4. Draw UI Elements
-        # Header Background
-        # Adjust bar width based on text length estimation
-        bar_width = 220
-        cv2.rectangle(self.canvas, (x1, y1), (x1 + bar_width, y1 + 30), bg_color, -1)
-
-        # Text
-        cv2.putText(
-            self.canvas, label, (x1 + 10, y1 + 22), self.FONT, self.FONT_SCALE, text_color, self.FONT_THICKNESS
-        )
-
-        # Border
-        cv2.rectangle(self.canvas, (x1, y1), (x2, y2), border_color, border_thick)
+    def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient):
+        """Simply forwards the metadata. High speed, no blocking."""
+        if self.display_queue:
+            try:
+                self.display_queue.put_nowait(batch_result)
+            except queue.Full:
+                pass
 
     def stop(self):
-        cv2.destroyAllWindows()
+        if self.proc:
+            self.proc.terminate()
+            self.proc.join()

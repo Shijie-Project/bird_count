@@ -14,7 +14,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger(__name__)
 
 # --- Constants & Defaults ---
-DEFAULT_MODEL_PATH = Path("./ckpts/shufflenet_best_model_214800.pth")
 DEFAULT_DEMO_VIDEO = Path("./data/bird_count_demo.mp4")
 
 
@@ -32,8 +31,8 @@ class SharedMemoryConfig(BaseModel):
 
     # Resolution for Storage (What is saved in RAM)
     # Usually matches the Camera Source (e.g., 1080x720)
-    width: int = 1080
     height: int = 720
+    width: int = 1080
     channels: int = 3
 
     @property
@@ -51,7 +50,8 @@ class ModelConfig(BaseModel):
     Configuration for the AI Inference Engine.
     """
 
-    path: Path = DEFAULT_MODEL_PATH
+    type: str = "shufflenet"
+    path: Path = Path("./ckpts/shufflenet_best_model_214800.pth")
 
     @field_validator("path")
     @classmethod

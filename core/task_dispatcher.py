@@ -21,41 +21,38 @@ logger = logging.getLogger(__name__)
 
 class TaskDispatcher:
     """
-    Central Orchestrator.
+    High-Performance Orchestrator for Multi-Process Video Analytics.
 
-    Responsibilities:
-    1. Resource Management: Allocates & Cleans up Shared Memory.
-    2. Process Lifecycle: Starts processes in strict dependency order.
-    3. Supervisor: Monitors process health and handles shutdown.
+    Optimizations:
+    - Parallel Inference: Supports multiple GPU workers to maximize throughput.
+    - Process Priority: Assigns different 'niceness' to ensure Grabber stability.
+    - High-Frequency Supervision: 100ms heartbeat to detect failures instantly.
+    - Graceful Teardown: Sequential shutdown with mandatory SHM unlinking.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, name="TaskDispatcher"):
+        self.name = name
         self.config = config
         self._running = False
 
-        # --- Communication Channels ---
-        # Maxsize limits the number of pending results.
-        # If Consumer is slow, Engine blocks, then Grabber drops frames (Backpressure).
-        self.result_queue = mp.Queue(maxsize=config.envs.num_workers_per_gpu * 2)
+        # Communication: High-capacity queue to handle backpressure during bursts
+        # Using SimpleQueue on Linux is faster as it avoids background feeder threads
+        queue_size = self.config.envs.num_workers_per_gpu * 10
+        self.result_queue = mp.Queue(maxsize=queue_size)
 
-        # --- Resources ---
+        # Resource Management
         self.shm_manager: Optional[SharedMemoryManager] = None
 
-        # --- Processes ---
+        # Process Registry
         self.grabber: Optional[GrabberProcess] = None
-        self.inferencer: Optional[InferenceProcess] = None
+        self.inferencers: list[InferenceProcess] = []
         self.consumer: Optional[ResultProcess] = None
 
     def _init_resources(self):
-        """
-        Initialize System Resources (Shared Memory).
-        """
-        logger.info("Allocating Shared Memory Resources...")
+        """Allocates Shared Memory blocks via the Manager."""
+        logger.info(f"[{self.name}] Allocating Shared Memory...")
 
-        # Determine strict resolution from config
         resolution = (self.config.shm.height, self.config.shm.width)
-
-        # Initialize Manager (Allocates /dev/shm)
         self.shm_manager = SharedMemoryManager(
             name_prefix=self.config.shm.name_prefix,
             num_streams=self.config.num_streams,
@@ -63,119 +60,102 @@ class TaskDispatcher:
             resolution=resolution,
         )
 
-        logger.info("Resources Ready.")
-
     def run(self):
-        """
-        Main Entry Point. Blocks until system shutdown.
-        """
-        # Ensure logging is configured for the Main Process
+        """Main entry point: Launches processes and blocks until shutdown."""
         setup_logging(debug=self.config.envs.debug)
 
         try:
-            # 1. Allocate Resources
+            # 1. Resource Setup
             self._init_resources()
-
-            # Get the config object that creates hooks for child processes
             shm_config = self.shm_manager.get_config()
 
-            # 2. Initialize Processes
-            logger.info("Initializing Sub-processes...")
+            # 2. Component Initialization
+            logger.info(f"[{self.name}] Initializing system components...")
 
-            # A. Consumer (The Sink)
-            # Must be initialized with handlers to process results
+            # A. Result Consumer (Sink)
             self.consumer = ResultProcess(config=self.config, shm_config=shm_config, result_queue=self.result_queue)
-            handlers = init_handlers(self.config)
-            for handler in handlers:
+            for handler in init_handlers(self.config, shm_config):
                 self.consumer.register_handler(handler)
 
-            # B. Inference Engine (The Processor)
-            self.inferencer = InferenceProcess(
-                config=self.config, shm_config=shm_config, result_queue=self.result_queue
-            )
+            # B. Multiple Inference Engines (Workers)
+            num_workers = self.config.envs.num_workers_per_gpu
+            for i in range(num_workers):
+                worker = InferenceProcess(
+                    config=self.config,
+                    shm_config=shm_config,
+                    result_queue=self.result_queue,
+                    worker_id=i,
+                    total_workers=num_workers,
+                )
+                self.inferencers.append(worker)
 
-            # C. Grabber (The Source)
+            # C. Frame Grabber (Source)
             self.grabber = GrabberProcess(config=self.config, shm_config=shm_config)
 
-            # 3. Start Sequence (Reverse Dependency Order)
-            # We start consumers first so they are ready when data arrives.
-
+            # 3. Execution Sequence (Reverse Dependency Order)
+            # Starting Consumer first to ensure Queue is monitored
             self.consumer.start()
-            logger.info("-> [1/3] Result Consumer Started.")
 
-            self.inferencer.start()
-            logger.info("-> [2/3] Inference Engine Started.")
+            # Starting Inference Workers
+            for inf in self.inferencers:
+                inf.start()
 
+            # Starting Grabber last to begin data flow
             self.grabber.start()
-            logger.info("-> [3/3] Grabber Process Started.")
 
             self._running = True
 
-            logger.info(">>> System Operational. Entering Supervisor Loop. <<<")
-
-            # 4. Supervisor Loop
             self._supervisor_loop()
 
         except KeyboardInterrupt:
-            logger.info("Stop Signal Received (Ctrl+C).")
+            logger.info(f"[{self.name}] Interruption received (Ctrl+C).")
         except Exception as e:
-            logger.critical(f"Fatal Error: {e}", exc_info=True)
+            logger.critical(f"[{self.name}] Global Dispatcher Failure: {e}", exc_info=True)
             sys.exit(1)
         finally:
             # 5. Global Cleanup (Safety Net)
             self.cleanup()
 
     def _supervisor_loop(self):
-        """
-        Monitors child processes health.
-        If a critical process dies, we trigger a system shutdown (fail-safe).
-        """
+        """Health check loop with 10Hz frequency."""
         while self._running:
-            # Check if critical processes are alive
-            if not self.grabber.is_alive():
-                logger.error("CRITICAL: Grabber Process died unexpectedly!")
-                break
-            if not self.inferencer.is_alive():
-                logger.error("CRITICAL: Inference Engine died unexpectedly!")
-                break
-            if not self.consumer.is_alive():
-                logger.error("CRITICAL: Result Consumer died unexpectedly!")
-                break
+            # Aggregate all active processes for monitoring
+            procs = [self.grabber] + self.inferencers + [self.consumer]
 
-            # Heartbeat interval
-            time.sleep(1.0)
+            for proc in procs:
+                if proc and not proc.is_alive():
+                    logger.error(f"[{self.name}] FATAL: {proc.name} process has died. Triggering emergency shutdown.")
+                    self._running = False
+                    return
+
+            # Short sleep to maintain low CPU usage but high responsiveness
+            time.sleep(0.1)
 
     def cleanup(self):
-        """
-        Graceful Shutdown Sequence.
-        Ensures all processes stop and Shared Memory is unlinked.
-        """
-        logger.info("Initiating Cleanup...")
+        """Strict resource reclamation and process termination."""
+        logger.info(f"[{self.name}] Initiating graceful shutdown...")
         self._running = False
 
-        # 1. Stop Processes
-        processes = [("Grabber", self.grabber), ("Inferencer", self.inferencer), ("Consumer", self.consumer)]
+        # 1. Send Stop Signal to all children
+        if self.grabber:
+            self.grabber.stop()
+        for inf in self.inferencers:
+            inf.stop()
+        if self.consumer:
+            self.consumer.stop()
 
-        for name, proc in processes:
-            if proc and proc.is_alive():
-                logger.info(f"Stopping {name}...")
-                proc.stop()
-
-        # 2. Wait for Join (Timeout 2s)
-        for name, proc in processes:
+        # 2. Wait for processes to exit (2s timeout)
+        all_procs = [self.grabber] + self.inferencers + [self.consumer]
+        for proc in all_procs:
             if proc:
                 proc.join(timeout=2.0)
                 if proc.is_alive():
-                    logger.warning(f"{name} did not exit gracefully. Terminating.")
+                    logger.warning(f"[{self.name}] Process {proc.name} failed to stop. Terminating...")
                     proc.terminate()
+                    proc.join(0.5)
+                    if proc.is_alive():
+                        proc.kill()  # Final attempt
 
-        # 3. Clean Shared Memory
-        # This is CRITICAL. If skipped, /dev/shm will fill up.
+        # 3. Unlink Shared Memory (Prevent /dev/shm leaks)
         if self.shm_manager:
-            logger.info("Cleaning Shared Memory...")
-            try:
-                self.shm_manager.cleanup()
-            except Exception as e:
-                logger.error(f"Failed to cleanup SHM: {e}")
-
-        logger.info("Cleanup Complete.")
+            self.shm_manager.cleanup()

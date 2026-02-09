@@ -10,49 +10,58 @@ from ..memory_manager import SharedMemoryClient
 class BaseHandler(ABC):
     """
     Abstract Base Class for all result handlers.
-    Ensures a consistent interface for the ResultConsumer.
+    Optimized for selective data fetching and bulk processing.
     """
 
+    def __init__(self, name: Optional[str] = None, needs_frames: bool = True):
+        # If False, we skip the expensive SHM frame indexing.
+        self.name = name or self.__class__.__name__
+        self.needs_frames = needs_frames
+
     def start(self):
-        """
-        Optional hook called when Consumer process starts.
-        Use this to initialize resources (db connections, window creation, etc).
-        """
+        """Optional hook called when Consumer process starts."""
         pass
 
-    def handle_batch(self, batch_result: Optional[BatchInferenceResult], shm_client: SharedMemoryClient):
+    def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient):
         """
-        [New] Process a BATCH of results.
+        Processes a BATCH of results.
+        Optimized to avoid unnecessary SHM access if needs_frames is False.
+        """
+        if not batch_result.results:
+            return
 
-        Default Implementation:
-        Iterates through the batch and calls the single-frame `handle` method for each item.
-        Subclasses (like DBHandler) can override this to perform bulk operations (e.g., bulk insert).
-        """
+        # 1. Bulk check: If the handler doesn't need frames, pass None for all frames
+        if not self.needs_frames:
+            for result in batch_result.results:
+                self.handle(result, None)
+            return
+
+        # 2. Sequential processing for handlers that need frames (e.g., Visualization, VideoWriter)
+        # Using vectorized properties of batch_result for cleaner access
         for result in batch_result.results:
-            # Lazy Loading: Only fetch the frame if the handler logic actually needs it.
-            # Here we assume most handlers (Vis, VideoWriter) need the frame.
-            # Direct Zero-Copy Access via numpy view
-            raw_frame = shm_client.frames[result.stream_id, result.buffer_idx]
+            try:
+                # Direct Zero-Copy Access via numpy view
+                # This is efficient, but still incurs a tiny overhead for array indexing
+                raw_frame = shm_client.frames[result.stream_id, result.buffer_idx]
+                self.handle(result, raw_frame)
+            except Exception as e:
+                # We log at the handler level to avoid crashing the whole ResultConsumer
+                import logging
 
-            self.handle(result, raw_frame)
+                logging.getLogger(__name__).error(f"[{self.name}] Error handling frame: {e}")
 
     @abstractmethod
-    def handle(self, result: InferenceResult, frame: np.ndarray):
+    def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
         """
         Process a single frame result.
 
         Args:
-            result: The DTO containing inference metadata (count, latency, stream_id).
-            frame: The raw video frame [H, W, 3] (uint8) read from Shared Memory.
+            result: The DTO containing inference metadata (count, alert_flag, threshold, etc).
+            frame: The raw video frame [H, W, 3] (uint8) or None if needs_frames=False.
                    NOTE: This is a direct view into Shared Memory.
-                   Do NOT modify it in-place unless you are sure.
-                   Copy it (frame.copy()) if you need to draw on it.
         """
         pass
 
     def stop(self):
-        """
-        Optional hook called when Consumer process stops.
-        Clean up resources here.
-        """
+        """Optional hook called when Consumer process stops."""
         pass
