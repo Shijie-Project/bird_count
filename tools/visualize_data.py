@@ -16,12 +16,8 @@ from torchvision import transforms
 # Add current directory to path to fix "No module named models"
 sys.path.append(os.path.dirname(Path(__file__).parents[1].as_posix()))
 
+from models import get_model
 
-try:
-    from models import get_model
-except ImportError:
-    st.error("❌ Could not find 'models.py'. Ensure it's in the same folder as this script.")
-    st.stop()
 
 warnings.filterwarnings("ignore")
 
@@ -72,7 +68,7 @@ def load_annotation(img_path, root_path, split):
 @st.cache_resource
 def load_model_cached(model_path):
     """Load and cache the model to prevent reloading on every interaction."""
-    model = get_model(model_path, device=DEVICE, fuse=True)
+    model = get_model("shufflnet", model_path, device=DEVICE, fuse=True)
     model.eval()
     return model
 
@@ -182,7 +178,7 @@ with col1:
 
         for p in points:
             # Handle normalized or pixel coordinates
-            cx, cy = (int(p[0] * w), int(p[1] * h)) if points.shape[1] == 3 else (int(p[0]), int(p[1]))
+            cx, cy = (int(p[1] * w), int(p[2] * h)) if points.shape[1] == 3 else (int(p[0]), int(p[1]))
             cv2.circle(disp_img, (cx, cy), pt_size, (255, 0, 0), -1)
             cv2.circle(disp_img, (cx, cy), pt_size + 2, (255, 255, 255), 1)
 
