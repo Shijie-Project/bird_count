@@ -12,7 +12,8 @@ zones:
       - "138.25.209.236"
       - "138.25.209.235"
       - "138.25.209.231"
-    smart_plugs: []
+    smart_plugs:
+      - "138.25.209.31"
 
   - name: "Zone_02_Left_Front"
     cameras:
@@ -25,7 +26,8 @@ zones:
       - "138.25.209.239"
       - "138.25.209.240"
       - "138.25.209.237"
-    smart_plugs: []
+    smart_plugs:
+      - "138.25.209.32"
 
   - name: "Zone_03_Right_Back"
     cameras:
@@ -38,6 +40,8 @@ zones:
       - "138.25.209.234"
       - "138.25.209.233"
       - "138.25.209.232"
+    smart_plugs:
+      - "138.25.209.33"
 
   - name: "Zone_04_Left_Back"
     cameras:
@@ -48,9 +52,13 @@ zones:
       - "138.25.209.111"
     speakers:
       - "138.25.209.238"
+      - "138.25.209.241"
+      - "138.25.209.242"
+    smart_plugs:
+      - "138.25.209.34"
 
   - name: "Zone_05_Right_Outer"
     cameras:
       - "138.25.209.206"
-    speakers:
-      - "138.25.209.241"
+    speakers: []
+    smart_plugs: []

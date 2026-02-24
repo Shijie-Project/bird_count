@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger(__name__)
 
 # --- Constants & Defaults ---
+DEFAULT_MODEL_PATH = Path("./ckpts/shufflenet_best_model_214800.pth")
 DEFAULT_DEMO_VIDEO = Path("./data/bird_count_demo.mp4")
 
 
@@ -50,8 +51,7 @@ class ModelConfig(BaseModel):
     Configuration for the AI Inference Engine.
     """
 
-    type: str = "shufflenet"
-    path: Path = Path("./ckpts/shufflenet_best_model_214800.pth")
+    path: Path = DEFAULT_MODEL_PATH
 
     @field_validator("path")
     @classmethod
@@ -113,6 +113,9 @@ class EnvSettings(BaseSettings):
     enable_smart_plug: bool = True
     enable_speaker: bool = True
 
+    tapo_email: str = None
+    tapo_password: str = None
+
     enable_trigger_gui: bool = True
 
     show_density_map: bool = True
@@ -133,7 +136,7 @@ class Config:
         # 1. Initialize Sub-Configs
         self.model = ModelConfig()
         self.shm = SharedMemoryConfig(num_buffers=envs.num_buffers)
-        self.plug_auth = SmartPlugAuthConfig()
+        self.plug_auth = SmartPlugAuthConfig(email=envs.tapo_email, password=envs.tapo_password)
 
         # 2. Hardware Detection
         self.device = self._detect_device(envs.cuda_device)
@@ -193,7 +196,7 @@ class Config:
                 sources.extend([str(self.envs.demo_video_path)] * len(zone.cameras))
             else:
                 # Add RTSP prefixes
-                sources.extend([f"http://root:root@{ip}/mjpg/1/video.mjpg" for ip in zone.cameras])  # noqa
+                sources.extend([f"https://root:root@{ip}/mjpg/1/video.mjpg" for ip in zone.cameras])  # noqa
 
         # Apply Global Limit (if set in .env)
         if self.envs.num_streams is not None:

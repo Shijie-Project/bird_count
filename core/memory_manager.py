@@ -93,7 +93,9 @@ class SharedMemoryManager:
             self._allocate_memory()
             self._initialize_metadata()
             config = self.get_config()
-            logger.info(f"[{self.name}] Frames: {config.frame_size_mb:.2f} MB | Meta: {config.meta_size_kb:.2f} KB")
+            logger.info(
+                f"[{self.name}] Frames: {config.frame_size_mb:.2f} MB | Meta: {config.meta_size_kb:.2f} KB | Shape: {self.shape}"
+            )
         except Exception as e:
             logger.error(f"[{self.name}] Allocation failed: {e}")
             self.cleanup()
