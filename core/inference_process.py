@@ -77,6 +77,9 @@ class InferenceProcess(mp.Process):
         self.total_workers = total_workers
         self._stop_event = mp.Event()
 
+        # 动态获取 monitor_only 配置
+        self.is_monitor_only = getattr(self.config.envs, "monitor_only", False)
+
         # --- Stream Partitioning ---
         # Logic: stream_id % total_workers == worker_id
         self.assigned_streams = [s for s in range(self.config.num_streams) if s % total_workers == worker_id]
@@ -96,6 +99,15 @@ class InferenceProcess(mp.Process):
     def _init_resource(self):
         """Initializes GPU and SHM resources within the child process context."""
         try:
+            # === Monitor Only 模式短路 ===
+            if self.is_monitor_only:
+                logger.info(f"[{self.name}] Running in MONITOR ONLY mode. Bypassing GPU & Model initialization.")
+                self.shm_client = SharedMemoryClient(self.shm_config)
+                self.shm_client.connect()
+                logger.info(f"[{self.name}] Initialization complete. Ready for streams {self.assigned_streams}")
+                return
+
+            # === 标准 Inference 模式初始化 ===
             setup_cuda()
             self.device = torch.device(self.config.device)
 
@@ -114,12 +126,6 @@ class InferenceProcess(mp.Process):
                 self.config.model.type, model_path=self.config.model.path, device=self.device, fuse=True
             )
             self.model.eval()
-            # try:
-            #     # 'reduce-overhead' is ideal for small models like ShuffleNet
-            #     self.model = torch.compile(self.model, mode="reduce-overhead")
-            #     logger.info(f"[{self.name}] Torch compilation enabled.")
-            # except Exception as e:
-            #     logger.warning(f"[{self.name}] Torch.compile failed: {e}. Using Eager mode.")
 
             # Connect to Shared Memory
             self.shm_client = SharedMemoryClient(self.shm_config)
@@ -195,14 +201,14 @@ class InferenceProcess(mp.Process):
 
         return res.to(torch.uint8)
 
-    def _collect_batch_from_shm(self) -> tuple[np.ndarray, np.ndarray, list, list]:
+    def _collect_batch_from_shm(self) -> tuple[np.ndarray | None, np.ndarray, list, list]:
         """Vectorized collection of ready frames from SHM."""
         ready_pairs = [
             (s_id, b_idx) for s_id in self.assigned_streams if (b_idx := self._get_latest_frame(s_id)) != -1
         ]
 
         if not ready_pairs:
-            return np.array([]), np.array([]), [], []
+            return None, np.array([]), [], []
 
         sids, b_idxs = map(list, zip(*ready_pairs))
 
@@ -210,7 +216,8 @@ class InferenceProcess(mp.Process):
         self.shm_client.metadata[sids, b_idxs]["state"] = BufferState.READING
 
         # Vectorized fetching of frames and metadata
-        batch_frames = self.shm_client.frames[sids, b_idxs]
+        # 性能优化：Monitor Only 模式下跳过庞大的图像数组拷贝
+        batch_frames = None if self.is_monitor_only else self.shm_client.frames[sids, b_idxs]
         batch_meta = self.shm_client.metadata[sids, b_idxs]
 
         return batch_frames, batch_meta, sids, b_idxs
@@ -249,36 +256,43 @@ class InferenceProcess(mp.Process):
 
                 # --- 1. Collection ---
                 batch_frames, batch_meta, sids, b_idxs = self._collect_batch_from_shm()
-                if batch_frames.size == 0:
+                if not sids:
                     time.sleep(0.001)
                     continue
 
-                # --- 2. GPU Preprocessing ---
-                input_tensor, raw_tensor = self._preprocess_batch_on_gpu(batch_frames)
-                t1 = time.perf_counter()
+                # --- 分支处理 ---
+                if self.is_monitor_only:
+                    t1 = t0
+                    t2 = t0
+                    process_time = time.time()
+                    counts_cpu = [0.0] * len(sids)
+                else:
+                    # --- 2. GPU Preprocessing ---
+                    input_tensor, raw_tensor = self._preprocess_batch_on_gpu(batch_frames)
+                    t1 = time.perf_counter()
 
-                # --- 3. Inference & Rendering ---
-                with torch.inference_mode(), torch.amp.autocast("cuda"):
-                    # Model Inference
-                    density_map = self.model(input_tensor)
-                    # Parallel sum for counts
-                    counts_tensor = torch.sum(density_map, dim=(1, 2, 3))
+                    # --- 3. Inference & Rendering ---
+                    with torch.inference_mode(), torch.amp.autocast("cuda"):
+                        # Model Inference
+                        density_map = self.model(input_tensor)
+                        # Parallel sum for counts
+                        counts_tensor = torch.sum(density_map, dim=(1, 2, 3))
 
-                    # Conditional visualization
+                        # Conditional visualization
+                        if self.config.envs.show_density_map:
+                            blended_gpu = self._apply_overlays_on_gpu(density_map, raw_tensor)
+
+                    # --- 4. Data Transfer (D2H) ---
+                    # Move counts to CPU (Tiny transfer, fast)
+                    counts_cpu = counts_tensor.cpu().numpy()
+
+                    # Move visualization frames to SHM (Large transfer, slow)
                     if self.config.envs.show_density_map:
-                        blended_gpu = self._apply_overlays_on_gpu(density_map, raw_tensor)
+                        # Async copy back to SHM slice
+                        self.shm_client.frames[sids, b_idxs] = blended_gpu.cpu().numpy()  # RGB
 
-                # --- 4. Data Transfer (D2H) ---
-                # Move counts to CPU (Tiny transfer, fast)
-                counts_cpu = counts_tensor.cpu().numpy()
-
-                # Move visualization frames to SHM (Large transfer, slow)
-                if self.config.envs.show_density_map:
-                    # Async copy back to SHM slice
-                    self.shm_client.frames[sids, b_idxs] = blended_gpu.cpu().numpy()  # RGB
-
-                t2 = time.perf_counter()
-                process_time = time.time()
+                    t2 = time.perf_counter()
+                    process_time = time.time()
 
                 # --- 5. Packaging (Optimized List Comprehension) ---
                 batch_packet = BatchInferenceResult(

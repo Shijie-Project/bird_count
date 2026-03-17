@@ -37,7 +37,7 @@ class _InternalMonitorRenderer:
     SCREEN_W, SCREEN_H = 1920, 1080
 
     def __init__(self, config: Config, window_name="Bird Detection Dashboard", name="Monitor"):
-        self.rgb_to_bgr = config.envs.show_density_map
+        self.rgb_to_bgr = config.envs.show_density_map and not config.envs.monitor_only
         self.window_name = window_name
         self.name = name
         self.num_streams = config.num_streams
@@ -84,7 +84,8 @@ class _InternalMonitorRenderer:
         # Throttled Window Refresh
         if now - self._last_ui_update >= self._ui_update_interval:
             if not self.is_window_setup:
-                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                cv2.namedWindow(self.window_name, cv2.WINDOW_FULLSCREEN)
+                cv2.moveWindow(self.window_name, 0, 0)
                 self._disable_window_close_button()
                 self.is_window_setup = True
 
