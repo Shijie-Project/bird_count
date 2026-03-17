@@ -13,10 +13,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Setup Module Logger
 logger = logging.getLogger(__name__)
 
-# --- Constants & Defaults ---
-DEFAULT_MODEL_PATH = Path("./ckpts/shufflenet_best_model_214800.pth")
-DEFAULT_DEMO_VIDEO = Path("./data/bird_count_demo.mp4")
-
 
 class SharedMemoryConfig(BaseModel):
     """
@@ -51,7 +47,7 @@ class ModelConfig(BaseModel):
     Configuration for the AI Inference Engine.
     """
 
-    path: Path = DEFAULT_MODEL_PATH
+    path: Path = None
 
     @field_validator("path")
     @classmethod
@@ -93,6 +89,8 @@ class EnvSettings(BaseSettings):
 
     debug: bool = False
 
+    model_path = None
+
     # Target FPS for the GrabberProcess.
     # 10 FPS is sufficient for crowd counting, saving PCIe bandwidth.
     fps: int = 10
@@ -107,7 +105,7 @@ class EnvSettings(BaseSettings):
 
     # Data Source: Real RTSP cameras or a looped Demo Video
     source_type: Literal["camera", "video"] = "camera"
-    demo_video_path: Path = DEFAULT_DEMO_VIDEO
+    demo_video_path: Path = Path("./data/bird_count_demo.mp4")
 
     enable_monitor: bool = True
     enable_smart_plug: bool = True
@@ -134,7 +132,7 @@ class Config:
         self.envs = envs
 
         # 1. Initialize Sub-Configs
-        self.model = ModelConfig()
+        self.model = ModelConfig(path=envs.model_path)
         self.shm = SharedMemoryConfig(num_buffers=envs.num_buffers)
         self.plug_auth = SmartPlugAuthConfig(email=envs.tapo_email, password=envs.tapo_password)
 
