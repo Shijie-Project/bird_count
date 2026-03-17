@@ -48,6 +48,7 @@ class ModelConfig(BaseModel):
     """
 
     path: Path = None
+    type: str = "shufflenet"
 
     @field_validator("path")
     @classmethod
@@ -89,7 +90,7 @@ class EnvSettings(BaseSettings):
 
     debug: bool = False
 
-    model_path = None
+    model_path: str = None
 
     # Target FPS for the GrabberProcess.
     # 10 FPS is sufficient for crowd counting, saving PCIe bandwidth.
@@ -110,6 +111,8 @@ class EnvSettings(BaseSettings):
     enable_monitor: bool = True
     enable_smart_plug: bool = True
     enable_speaker: bool = True
+
+    monitor_only: bool = False
 
     tapo_email: str = None
     tapo_password: str = None
@@ -132,7 +135,7 @@ class Config:
         self.envs = envs
 
         # 1. Initialize Sub-Configs
-        self.model = ModelConfig(path=envs.model_path)
+        self.model = ModelConfig(path=Path(envs.model_path))
         self.shm = SharedMemoryConfig(num_buffers=envs.num_buffers)
         self.plug_auth = SmartPlugAuthConfig(email=envs.tapo_email, password=envs.tapo_password)
 
