@@ -22,7 +22,7 @@ from models import get_model
 warnings.filterwarnings("ignore")
 
 # ================= 配置区域 =================
-DEFAULT_DATA_ROOT = "./data"
+DEFAULT_DATA_ROOT = "../data"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ===========================================
 
@@ -207,7 +207,7 @@ with col2:
 
     st.divider()
     st.write("### 🤖 Inference")
-    model_path = st.text_input("Model Path", value="./ckpts/shufflenet_model_best.pth")
+    model_path = st.text_input("Model Path", value="../ckpts/shufflenet_model_best.pth")
 
     if st.button("🚀 Run Prediction", type="primary", use_container_width=True):
         if os.path.exists(model_path):

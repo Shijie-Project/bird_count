@@ -198,8 +198,8 @@ def export_to_onnx(model_path, onnx_output_path, device="cuda"):
 
 
 if __name__ == "__main__":
-    CHECKPOINT = "./ckpts/shufflenet_best_model_214800.pth"
-    OUTPUT_ONNX = "./ckpts/shufflenet_best_model_214800.onnx"
+    CHECKPOINT = "../ckpts/shufflenet_best_model_214800.pth"
+    OUTPUT_ONNX = "../ckpts/shufflenet_best_model_214800.onnx"
     export_to_onnx(CHECKPOINT, OUTPUT_ONNX)
 
     import onnx

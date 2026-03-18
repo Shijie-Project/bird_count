@@ -2,12 +2,20 @@ import argparse
 import os
 import warnings
 
+import dotenv
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from datasets.bird import Bird
 from models.shufflenet import get_shufflenet_density_model
+
+
+dotenv.load_dotenv()
+
+CHECKPOINT_PATH = os.getenv("MODEL_PATH", None)
+if CHECKPOINT_PATH is None:
+    raise ValueError("Please set MODEL_PATH in .env file.")
 
 
 warnings.simplefilter("ignore", UserWarning)
@@ -17,14 +25,9 @@ def get_args():
     parser = argparse.ArgumentParser(description="Test")
     parser.add_argument("--device", default="0", help="assign device")
     parser.add_argument("--split", default="val", choices=["val", "train"], help="split dataset")
-    parser.add_argument("--legacy-data", action="store_true", help="whether to use legacy data format")
-    parser.add_argument("--model", default="shufflenet", choices=["vgg", "shufflenet"], help="model name")
-    parser.add_argument("--checkpoint", type=str, default="./ckpts/shufflenet_best_model.pth", help="saved model path")
-    parser.add_argument("--data-path", type=str, default="./data", help="saved model path")
+    parser.add_argument("--data-path", type=str, default="../data", help="saved data path")
     parser.add_argument("--crop-size", type=int, default=512, help="the crop size of the train image")
-    parser.add_argument(
-        "--density-map-path", type=str, default="./data/density_maps", help="folder to save predicted density maps."
-    )
+    parser.add_argument("--no-density-map", action="store_true", help="no density map")
     args = parser.parse_args()
     return args
 
@@ -35,20 +38,22 @@ def main():
     torch.cuda.set_device(int(args.device))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = Bird(args.data_path, args.crop_size, 8, split=args.split + ("_legacy" if args.legacy_data else ""))
+    dataset = Bird(args.data_path, args.crop_size, 8, split=args.split)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
 
     density_map_path = None
-    if args.density_map_path:
+    if not args.no_density_map:
         import cv2
 
-        density_map_path = os.path.join(args.density_map_path, args.checkpoint.split("/")[-1].split(".")[0])
+        density_map_path = os.path.join(
+            os.path.join(args.data_path, "density_maps"), CHECKPOINT_PATH.split("/")[-1].split(".")[0]
+        )
         if not os.path.exists(density_map_path):
             os.makedirs(density_map_path)
 
     model = get_shufflenet_density_model()
 
-    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.to(device)
     model.eval()
 
