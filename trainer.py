@@ -38,7 +38,7 @@ class Trainer:
             time.strftime("%Y%m%d-%H%M%S"),
         )
 
-        self.save_dir = os.path.join("ckpts", sub_dir)
+        self.save_dir = os.path.join(args.checkpoint_dir, sub_dir)
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
