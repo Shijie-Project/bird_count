@@ -40,6 +40,8 @@ class CameraThread(threading.Thread):
     def run(self):
         """Optimized connection and capture loop."""
         while self._running:
+            self._send_dummy_frame()
+
             # OPTIMIZATION: Use API preference for hardware acceleration if available
             # e.g., cv2.CAP_FFMPEG or specific HW backends
             cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
@@ -142,6 +144,21 @@ class CameraThread(threading.Thread):
 
     def stop(self):
         self._running = False
+
+    def _send_dummy_frame(self):
+        dummy_frame = np.zeros((self.target_size[1], self.target_size[0], 3), dtype=np.uint8)
+
+        # Draw "NO SIGNAL" text
+        text = "NO SIGNAL"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 2
+        thickness = 3
+        (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        cx = (self.target_size[0] - tw) // 2
+        cy = (self.target_size[1] + th) // 2
+        cv2.putText(dummy_frame, text, (cx, cy), font, font_scale, (200, 200, 200), thickness)
+
+        self._process_frame(dummy_frame)
 
 
 class GrabberProcess(mp.Process):
