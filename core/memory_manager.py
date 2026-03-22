@@ -102,15 +102,25 @@ class SharedMemoryManager:
             raise
 
     def _allocate_memory(self):
-        """Creates blocks, unlinking stale ones if needed."""
-        self._unlink_if_exists(self.shm_name)
-        self._unlink_if_exists(self.meta_name)
-
         frame_size = int(np.prod(self.shape) * np.dtype(self.frame_dtype).itemsize)
-        self._shm = shm.SharedMemory(name=self.shm_name, create=True, size=frame_size)
-
         meta_size = int(np.prod(self.meta_shape) * METADATA_DTYPE.itemsize)
-        self._meta_shm = shm.SharedMemory(name=self.meta_name, create=True, size=meta_size)
+
+        # 1. 尝试分配 Frame 内存
+        try:
+            self._shm = shm.SharedMemory(name=self.shm_name, create=True, size=frame_size)
+        except FileExistsError:
+            logger.warning(f"[{self.name}] '{self.shm_name}' already exists. Attaching to existing block.")
+            self._shm = shm.SharedMemory(name=self.shm_name, create=False)
+            # 可选：校验 size 是否一致
+            if self._shm.size < frame_size:
+                raise ValueError(f"Existing shm size ({self._shm.size}) is smaller than required ({frame_size})")
+
+        # 2. 尝试分配 Meta 内存
+        try:
+            self._meta_shm = shm.SharedMemory(name=self.meta_name, create=True, size=meta_size)
+        except FileExistsError:
+            logger.warning(f"[{self.name}] '{self.meta_name}' already exists. Attaching to existing block.")
+            self._meta_shm = shm.SharedMemory(name=self.meta_name, create=False)
 
     def _initialize_metadata(self):
         """Vectorized initialization of metadata block."""
