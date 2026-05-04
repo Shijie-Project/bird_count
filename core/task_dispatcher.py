@@ -28,7 +28,11 @@ class TaskDispatcher:
     - Process Priority: Assigns different 'niceness' to ensure Grabber stability.
     - High-Frequency Supervision: 100ms heartbeat to detect failures instantly.
     - Graceful Teardown: Sequential shutdown with mandatory SHM unlinking.
+    - Restart Policy: each child process is restarted up to MAX_RESTARTS times before
+      escalating to a full system shutdown (cumulative across the dispatcher's lifetime).
     """
+
+    MAX_RESTARTS = 5
 
     def __init__(self, config: Config, name="TaskDispatcher"):
         self.name = name
@@ -52,6 +56,9 @@ class TaskDispatcher:
         self.grabber: Optional[GrabberProcess] = None
         self.inferencers: list[InferenceProcess] = []
         self.consumer: Optional[ResultProcess] = None
+
+        # Cumulative restart attempts per logical process slot.
+        self._restart_counts: dict[str, int] = {}
 
     def _init_resources(self):
         """Allocates Shared Memory blocks via the Manager."""
@@ -127,19 +134,109 @@ class TaskDispatcher:
             self.cleanup()
 
     def _supervisor_loop(self):
-        """Health check loop with 10Hz frequency."""
-        while self._running:
-            # Aggregate all active processes for monitoring
-            procs = [self.grabber] + self.inferencers + [self.consumer]
+        """
+        Restart-aware health check loop.
 
-            for proc in procs:
-                if proc and not proc.is_alive():
-                    logger.error(f"[{self.name}] FATAL: {proc.name} process has died. Triggering emergency shutdown.")
-                    self._running = False
+        On detecting a dead child process, attempt an in-place restart of that one
+        process up to MAX_RESTARTS times (cumulative). After exhausting restarts,
+        escalate to full system shutdown.
+        """
+        while self._running:
+            # Grabber
+            if self.grabber and not self.grabber.is_alive():
+                if not self._try_restart_grabber():
                     return
 
-            # Short sleep to maintain low CPU usage but high responsiveness
+            # Inference workers (indexed by worker_id == list position)
+            for i, inf in enumerate(list(self.inferencers)):
+                if inf and not inf.is_alive():
+                    if not self._try_restart_inferencer(i):
+                        return
+
+            # Consumer
+            if self.consumer and not self.consumer.is_alive():
+                if not self._try_restart_consumer():
+                    return
+
             time.sleep(0.1)
+
+    # ------------------------------------------------------------------
+    # Restart helpers
+    # ------------------------------------------------------------------
+
+    def _claim_restart_slot(self, key: str, proc_label: str) -> bool:
+        """Bump the restart counter for `key`; return False if budget exhausted."""
+        n = self._restart_counts.get(key, 0)
+        if n >= self.MAX_RESTARTS:
+            logger.critical(
+                f"[{self.name}] {proc_label} died and has exhausted its restart budget "
+                f"({n}/{self.MAX_RESTARTS}). Escalating to full system shutdown."
+            )
+            self._running = False
+            return False
+        self._restart_counts[key] = n + 1
+        logger.warning(
+            f"[{self.name}] {proc_label} died. Restart attempt {self._restart_counts[key]}/{self.MAX_RESTARTS}."
+        )
+        return True
+
+    def _try_restart_grabber(self) -> bool:
+        if not self._claim_restart_slot("grabber", "GrabberProcess"):
+            return False
+        try:
+            if self.grabber:
+                self.grabber.join(timeout=0.5)
+        except Exception:
+            pass
+        shm_config = self.shm_manager.get_config()
+        self.grabber = GrabberProcess(config=self.config, shm_config=shm_config)
+        self.grabber.start()
+        return True
+
+    def _try_restart_inferencer(self, idx: int) -> bool:
+        key = f"inferencer-{idx}"
+        if not self._claim_restart_slot(key, f"InferenceWorker-{idx}"):
+            return False
+        try:
+            old = self.inferencers[idx]
+            if old:
+                old.join(timeout=0.5)
+        except Exception:
+            pass
+        shm_config = self.shm_manager.get_config()
+        num_workers = self.config.envs.num_workers_per_gpu
+        new_worker = InferenceProcess(
+            config=self.config,
+            shm_config=shm_config,
+            result_queue=self.result_queue,
+            worker_id=idx,
+            total_workers=num_workers,
+        )
+        self.inferencers[idx] = new_worker
+        new_worker.start()
+        return True
+
+    def _try_restart_consumer(self) -> bool:
+        if not self._claim_restart_slot("consumer", "ResultConsumer"):
+            return False
+        try:
+            if self.consumer:
+                self.consumer.join(timeout=0.5)
+        except Exception:
+            pass
+        shm_config = self.shm_manager.get_config()
+        # Rebuild consumer + handlers from scratch — handler in-process state (display
+        # process, executors, audit fh) was tied to the dead consumer.
+        self.consumer = ResultProcess(
+            config=self.config,
+            shm_config=shm_config,
+            result_queue=self.result_queue,
+            ack_queue=self.ack_queue,
+        )
+        for handler in init_handlers(self.config, shm_config, ack_queue=self.ack_queue):
+            self.consumer.register_handler(handler)
+        self.consumer.start()
+        return True
 
     def cleanup(self):
         """Strict resource reclamation and process termination."""

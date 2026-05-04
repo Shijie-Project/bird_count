@@ -14,6 +14,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger(__name__)
 
 
+class ConfigError(Exception):
+    """Raised on invalid or incomplete system configuration."""
+
+
 class SharedMemoryConfig(BaseModel):
     """
     Configuration for Shared Memory (SHM) management.
@@ -91,6 +95,8 @@ class EnvSettings(BaseSettings):
     debug: bool = False
 
     model_path: str = None
+    image_height: int = 720
+    image_width: int = 1080
 
     # Target FPS for the GrabberProcess.
     # 10 FPS is sufficient for crowd counting, saving PCIe bandwidth.
@@ -125,6 +131,9 @@ class EnvSettings(BaseSettings):
 
     show_density_map: bool = True
 
+    # Audit log path (JSONL). Empty string disables auditing.
+    audit_log_path: str = "logs/audit.jsonl"
+
     # Pydantic V2 config
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -138,9 +147,16 @@ class Config:
     def __init__(self, envs: EnvSettings):
         self.envs = envs
 
+        # 0. Up-front sanity checks (fail fast with actionable messages).
+        self._validate_envs(envs)
+
         # 1. Initialize Sub-Configs
-        self.model = ModelConfig(path=Path(envs.model_path))
-        self.shm = SharedMemoryConfig(num_buffers=envs.num_buffers)
+        # In monitor_only mode we never load a model, so model_path is allowed to be empty.
+        if envs.model_path:
+            self.model = ModelConfig(path=Path(envs.model_path))
+        else:
+            self.model = None
+        self.shm = SharedMemoryConfig(num_buffers=envs.num_buffers, height=envs.image_height, width=envs.image_width)
         self.plug_auth = SmartPlugAuthConfig(email=envs.tapo_email, password=envs.tapo_password)
 
         # 2. Hardware Detection
@@ -160,6 +176,43 @@ class Config:
 
         self._log_configuration()
 
+    @staticmethod
+    def _validate_envs(envs: EnvSettings):
+        """Pre-flight validation. Raises ConfigError with actionable messages."""
+        # 1. model_path must be present unless we are in monitor-only mode.
+        if not envs.monitor_only and not envs.model_path:
+            raise ConfigError(
+                "model_path is required when monitor_only=False. "
+                "Set MODEL_PATH in your .env file (or environment) "
+                "or run with MONITOR_ONLY=True for the no-inference dashboard."
+            )
+
+        # 2. If a model_path is provided, the file should exist (warn-not-fail to allow
+        #    container builds where the weights are mounted later).
+        if envs.model_path:
+            mp_path = Path(envs.model_path)
+            if not mp_path.exists():
+                logger.warning(
+                    f"model_path={mp_path} does not exist yet. Make sure it is mounted before launching the worker."
+                )
+
+        # 3. Demo video mode requires the demo file.
+        if envs.source_type == "video":
+            demo_path = Path(envs.demo_video_path)
+            if not demo_path.exists():
+                raise ConfigError(
+                    f"source_type=video but demo_video_path does not exist: {demo_path}. "
+                    "Provide a valid mp4 path or switch source_type to 'camera'."
+                )
+
+        # 4. Topology file must exist (loaded later by _load_default_topology).
+        yaml_path = Path(__file__).parents[1] / "topology.yaml"
+        if not yaml_path.exists():
+            raise ConfigError(
+                f"Topology file not found: {yaml_path}. "
+                "Create topology.yaml at the project root with at least one zone."
+            )
+
     def _detect_device(self, device_id: str) -> torch.device:
         if torch.cuda.is_available():
             d = f"cuda:{device_id}"
@@ -171,20 +224,31 @@ class Config:
 
     def _load_default_topology(self) -> tuple[ZoneConfig, ...]:
         """
-        Loads zone configuration from a YAML file.
+        Loads zone configuration from a YAML file. Existence already verified
+        in _validate_envs(); here we focus on parse + schema errors.
         """
         yaml_path = Path(__file__).parents[1] / "topology.yaml"
 
         try:
             with open(yaml_path, encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-
-            zones = [ZoneConfig(**z) for z in data.get("zones", [])]
-            logger.info(f"Successfully loaded {len(zones)} zones from {yaml_path}")
-            return tuple(zones)
+                data = yaml.safe_load(f) or {}
         except Exception as e:
-            logger.error(f"Failed to load YAML topology: {e}.")
-            sys.exit(1)
+            raise ConfigError(f"Failed to parse {yaml_path}: {e}") from e
+
+        zones_raw = data.get("zones", [])
+        if not zones_raw:
+            raise ConfigError(
+                f"{yaml_path} has no zones defined under the 'zones:' key. "
+                "Define at least one zone with cameras/speakers/smart_plugs."
+            )
+
+        try:
+            zones = [ZoneConfig(**z) for z in zones_raw]
+        except Exception as e:
+            raise ConfigError(f"Invalid zone definition in {yaml_path}: {e}") from e
+
+        logger.info(f"Successfully loaded {len(zones)} zones from {yaml_path}")
+        return tuple(zones)
 
     def _resolve_stream_sources(self) -> tuple[str, ...]:
         """
@@ -223,7 +287,8 @@ class Config:
         logger.info(f"Stream Count: {self.num_streams}")
         logger.info(f"Target FPS  : {self.fps}")
         logger.info(f"SHM Buffers : {self.num_buffers}")
-        logger.info(f"Num Workers  : {self.num_workers_per_gpu}")
+        logger.info(f"SHM Shapes  : {self.shm.height}x{self.shm.width}")
+        logger.info(f"Num Workers : {self.num_workers_per_gpu}")
         logger.info("-" * 40)
 
         logger.info(">- Zone Topology")
@@ -282,6 +347,9 @@ class Config:
             config = cls(envs)
             logger.info("Configuration Loaded Successfully.")
             return config
+        except ConfigError as e:
+            logger.critical(f"Configuration error: {e}")
+            sys.exit(1)
         except Exception as e:
-            logger.critical(f"Failed to load configuration: {e}")
+            logger.critical(f"Failed to load configuration: {e}", exc_info=True)
             sys.exit(1)

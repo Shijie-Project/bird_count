@@ -4,6 +4,7 @@ import queue
 import time
 from typing import Optional
 
+from .audit import AuditLog
 from .config import Config
 from .handlers import BaseHandler
 from .inference_process import BatchInferenceResult
@@ -62,6 +63,11 @@ class ResultProcess(mp.Process):
         # Pending-ack registry: (sid, b_idx) -> claim_timestamp.
         self.pending_acks: dict[tuple[int, int], float] = {}
 
+        # Audit log + previous alert state per stream (for rising-edge detection).
+        # Both are constructed lazily inside run() because file handles can't be pickled.
+        self.audit: Optional[AuditLog] = None
+        self._prev_alert: dict[int, bool] = {}
+
     def register_handler(self, handler: BaseHandler):
         """Registers a plugin to process finalized results."""
         self.handlers.append(handler)
@@ -71,9 +77,13 @@ class ResultProcess(mp.Process):
         if stream_id in self.manual_override_streams:
             self.manual_override_streams.remove(stream_id)
             logger.info(f"[{self.name}] Manual Hijack DISABLED for Stream {stream_id}.")
+            if self.audit:
+                self.audit.log("hijack.disable", stream_id=stream_id)
         else:
             self.manual_override_streams.add(stream_id)
             logger.info(f"[{self.name}] Manual Hijack ENABLED for Stream {stream_id}. Forcing all alerts to True.")
+            if self.audit:
+                self.audit.log("hijack.enable", stream_id=stream_id)
 
     def _handle_cancel_all(self):
         """
@@ -96,6 +106,15 @@ class ResultProcess(mp.Process):
             f"[{self.name}] CANCEL ALL invoked. Cleared hijacks={cleared_hijacks}, "
             f"reset {len(cleared_hijacks)} hijack(s) and all hold-down timers."
         )
+        if self.audit:
+            self.audit.log(
+                "alert.cancel_all",
+                cleared_hijacks=cleared_hijacks,
+                handlers=[type(h).__name__ for h in self.handlers],
+            )
+
+        # Cancel-all also clears rising-edge state so the next genuine breach is logged.
+        self._prev_alert.clear()
 
     def _get_active_devices_snapshot(self) -> dict[str, set[str]]:
         """Aggregate active-device sets across handlers for GUI status display."""
@@ -111,32 +130,46 @@ class ResultProcess(mp.Process):
         """
         Fast in-place alert evaluation with hold-down logic.
         Avoids creating new objects to reduce GC pressure.
+        Emits rising/falling-edge audit events.
         """
         now = time.time()
         for result in batch_packet.results:
             sid = result.stream_id
+            threshold = self.stream_thresholds.get(sid, float("inf"))
 
             # 1. Manual hijack short-circuits everything (no hold-down).
             if sid in self.manual_override_streams:
                 result.alert_flag = True
-                continue
-
-            threshold = self.stream_thresholds.get(sid, float("inf"))
-            above = result.count >= threshold
-
-            if not above:
-                # Drop below threshold -> reset hold-down timer.
-                self.alert_first_seen.pop(sid, None)
-                result.alert_flag = False
-                continue
-
-            # 2. Hold-down: alert only fires after sustained breach.
-            first_seen = self.alert_first_seen.get(sid)
-            if first_seen is None:
-                self.alert_first_seen[sid] = now
-                result.alert_flag = self.trigger_delay <= 0.0
             else:
-                result.alert_flag = (now - first_seen) >= self.trigger_delay
+                above = result.count >= threshold
+
+                if not above:
+                    # Drop below threshold -> reset hold-down timer.
+                    self.alert_first_seen.pop(sid, None)
+                    result.alert_flag = False
+                else:
+                    # 2. Hold-down: alert only fires after sustained breach.
+                    first_seen = self.alert_first_seen.get(sid)
+                    if first_seen is None:
+                        self.alert_first_seen[sid] = now
+                        result.alert_flag = self.trigger_delay <= 0.0
+                    else:
+                        result.alert_flag = (now - first_seen) >= self.trigger_delay
+
+            # 3. Rising/falling-edge audit logging.
+            if self.audit:
+                prev = self._prev_alert.get(sid, False)
+                if result.alert_flag and not prev:
+                    self.audit.log(
+                        "alert.trigger",
+                        stream_id=sid,
+                        count=result.count,
+                        threshold=threshold,
+                        hijacked=sid in self.manual_override_streams,
+                    )
+                elif prev and not result.alert_flag:
+                    self.audit.log("alert.clear", stream_id=sid, count=result.count)
+            self._prev_alert[sid] = result.alert_flag
 
     def _release_buffers(self, shm_client: SharedMemoryClient, pairs):
         """Bulk-mark a list/set of (sid, b_idx) pairs FREE."""
@@ -186,6 +219,10 @@ class ResultProcess(mp.Process):
         """Main consumption loop."""
         setup_logging(self.config.envs.debug)
         logger.info(f"[{self.name}] Process Started.")
+
+        # 0. Audit log (per-process file handle; cannot be pickled across spawn).
+        self.audit = AuditLog(self.config.envs.audit_log_path, name="ResultProcess")
+        self.audit.log("process.start", name=self.name)
 
         # 1. Resource Setup
         shm_client = SharedMemoryClient(self.shm_config)
@@ -279,6 +316,9 @@ class ResultProcess(mp.Process):
             self.pending_acks.clear()
 
         shm_client.disconnect()
+        if self.audit:
+            self.audit.log("process.stop", name=self.name)
+            self.audit.close()
         logger.info(f"[{self.name}] Stopped.")
 
     def stop(self):
