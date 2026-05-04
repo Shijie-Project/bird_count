@@ -22,19 +22,24 @@ class BaseHandler(ABC):
         """Optional hook called when Consumer process starts."""
         pass
 
-    def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient):
+    def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient) -> set[tuple[int, int]]:
         """
         Processes a BATCH of results.
-        Optimized to avoid unnecessary SHM access if needs_frames is False.
+
+        Returns:
+            A set of (stream_id, buffer_idx) pairs that this handler is "claiming"
+            for asynchronous post-processing. ResultProcess will defer the SHM
+            release for those slots until the handler acks via ack_queue.
+            Default: empty set (synchronous handler — release immediately).
         """
         if not batch_result.results:
-            return
+            return set()
 
         # 1. Bulk check: If the handler doesn't need frames, pass None for all frames
         if not self.needs_frames:
             for result in batch_result.results:
                 self.handle(result, None)
-            return
+            return set()
 
         # 2. Sequential processing for handlers that need frames (e.g., Visualization, VideoWriter)
         # Using vectorized properties of batch_result for cleaner access
@@ -49,6 +54,7 @@ class BaseHandler(ABC):
                 import logging
 
                 logging.getLogger(__name__).error(f"[{self.name}] Error handling frame: {e}")
+        return set()
 
     @abstractmethod
     def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):

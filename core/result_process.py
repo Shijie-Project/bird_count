@@ -2,6 +2,7 @@ import logging
 import multiprocessing as mp
 import queue
 import time
+from typing import Optional
 
 from .config import Config
 from .handlers import BaseHandler
@@ -17,13 +18,31 @@ class ResultProcess(mp.Process):
     """
     High-throughput Result Consumer.
     Evaluates thresholds, triggers alerts (with hold-down delay), and manages the SHM lifecycle.
+
+    SHM lifecycle:
+    - Synchronous handlers (e.g. SmartPlug, Speaker) finish before this process loops, so
+      their buffers are freed immediately.
+    - Asynchronous handlers (e.g. MonitorHandler -> DisplayProcess) "claim" the buffer by
+      returning the (sid, b_idx) pairs from handle_batch(). Those slots stay in READING
+      state until the handler acks via ack_queue. A stale-ack sweep force-releases any
+      buffer held longer than ack_timeout seconds (safety net for crashed sub-processes).
     """
 
-    def __init__(self, config: Config, shm_config: SharedMemoryConfig, result_queue: mp.Queue):
+    ACK_TIMEOUT_SEC = 5.0
+    MAX_ACKS_PER_DRAIN = 128
+
+    def __init__(
+        self,
+        config: Config,
+        shm_config: SharedMemoryConfig,
+        result_queue: mp.Queue,
+        ack_queue: Optional[mp.Queue] = None,
+    ):
         super().__init__(name="ResultConsumer")
         self.config = config
         self.shm_config = shm_config
         self.result_queue = result_queue
+        self.ack_queue = ack_queue
         self._stop_event = mp.Event()
         self.handlers: list[BaseHandler] = []
 
@@ -39,6 +58,9 @@ class ResultProcess(mp.Process):
         # Cleared on cancel_all() and whenever the count drops below threshold.
         self.alert_first_seen: dict[int, float] = {}
         self.trigger_delay: float = float(getattr(self.config.envs, "alert_trigger_delay", 0.0))
+
+        # Pending-ack registry: (sid, b_idx) -> claim_timestamp.
+        self.pending_acks: dict[tuple[int, int], float] = {}
 
     def register_handler(self, handler: BaseHandler):
         """Registers a plugin to process finalized results."""
@@ -116,6 +138,50 @@ class ResultProcess(mp.Process):
             else:
                 result.alert_flag = (now - first_seen) >= self.trigger_delay
 
+    def _release_buffers(self, shm_client: SharedMemoryClient, pairs):
+        """Bulk-mark a list/set of (sid, b_idx) pairs FREE."""
+        if not pairs:
+            return
+        sids = [p[0] for p in pairs]
+        b_idxs = [p[1] for p in pairs]
+        if b_idxs and b_idxs[0] != -1:
+            shm_client.metadata[sids, b_idxs]["state"] = BufferState.FREE
+
+    def _drain_ack_queue(self, shm_client: SharedMemoryClient):
+        """Non-blocking drain of incoming acks. Releases acked buffers."""
+        if self.ack_queue is None:
+            return
+        released: list[tuple[int, int]] = []
+        for _ in range(self.MAX_ACKS_PER_DRAIN):
+            try:
+                pairs = self.ack_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception as e:
+                logger.error(f"[{self.name}] ack_queue read error: {e}")
+                break
+            for pair in pairs:
+                key = (int(pair[0]), int(pair[1]))
+                if self.pending_acks.pop(key, None) is not None:
+                    released.append(key)
+        if released:
+            self._release_buffers(shm_client, released)
+
+    def _sweep_stale_acks(self, shm_client: SharedMemoryClient, now: float):
+        """Force-release buffers whose ack never arrived (handler crash safety net)."""
+        if not self.pending_acks:
+            return
+        cutoff = now - self.ACK_TIMEOUT_SEC
+        stale = [k for k, t in self.pending_acks.items() if t < cutoff]
+        if not stale:
+            return
+        for k in stale:
+            self.pending_acks.pop(k, None)
+        self._release_buffers(shm_client, stale)
+        logger.warning(
+            f"[{self.name}] Force-released {len(stale)} stale ack(s) after {self.ACK_TIMEOUT_SEC}s timeout."
+        )
+
     def run(self):
         """Main consumption loop."""
         setup_logging(self.config.envs.debug)
@@ -148,24 +214,38 @@ class ResultProcess(mp.Process):
                 gui = None
 
         # 3. Consumption Loop
+        last_stale_sweep = time.time()
         while not self._stop_event.is_set():
-            # Always service the GUI event loop, even when no results are flowing.
+            # Always service GUI + ack queue, even when no results are flowing.
             if gui:
                 gui.update()
+            self._drain_ack_queue(shm_client)
+
+            # Stale-ack sweep at most every second.
+            now = time.time()
+            if now - last_stale_sweep >= 1.0:
+                self._sweep_stale_acks(shm_client, now)
+                last_stale_sweep = now
 
             try:
                 batch_packet: BatchInferenceResult = self.result_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
 
+            sids = batch_packet.stream_ids
+            b_idxs = batch_packet.buffer_indices
+            all_claimed: set[tuple[int, int]] = set()
+
             try:
                 # A. Logical Evaluation (In-place)
                 self._evaluate_alerts_inplace(batch_packet)
 
-                # B. Plugin Dispatch
+                # B. Plugin Dispatch — collect claimed buffer pairs from each handler.
                 for handler in self.handlers:
                     try:
-                        handler.handle_batch(batch_packet, shm_client)
+                        claimed = handler.handle_batch(batch_packet, shm_client)
+                        if claimed:
+                            all_claimed |= claimed
                     except Exception as e:
                         logger.error(f"[{self.name}] Handler {type(handler).__name__} error: {e}")
 
@@ -173,12 +253,17 @@ class ResultProcess(mp.Process):
                 logger.error(f"[{self.name}] Unexpected loop error: {e}")
 
             finally:
-                # C. CRITICAL: Atomic SHM Release
-                sids = batch_packet.stream_ids
-                b_idxs = batch_packet.buffer_indices
-
+                # C. SHM Release: free unclaimed slots immediately, defer claimed ones until ack.
                 if b_idxs and b_idxs[0] != -1:
-                    shm_client.metadata[sids, b_idxs]["state"] = BufferState.FREE
+                    claim_ts = time.time()
+                    to_release: list[tuple[int, int]] = []
+                    for s, b in zip(sids, b_idxs):
+                        key = (int(s), int(b))
+                        if key in all_claimed:
+                            self.pending_acks[key] = claim_ts
+                        else:
+                            to_release.append(key)
+                    self._release_buffers(shm_client, to_release)
 
         # 4. Cleanup Sequence
         if gui:
@@ -186,6 +271,12 @@ class ResultProcess(mp.Process):
 
         for h in self.handlers:
             h.stop()
+
+        # Drain any final acks / release leftover buffers so SHM is clean.
+        self._drain_ack_queue(shm_client)
+        if self.pending_acks:
+            self._release_buffers(shm_client, list(self.pending_acks.keys()))
+            self.pending_acks.clear()
 
         shm_client.disconnect()
         logger.info(f"[{self.name}] Stopped.")

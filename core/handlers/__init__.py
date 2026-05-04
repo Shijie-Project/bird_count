@@ -1,4 +1,6 @@
 import logging
+import multiprocessing as mp
+from typing import Optional
 
 from ..config import Config
 from ..memory_manager import SharedMemoryConfig
@@ -11,7 +13,11 @@ from .speaker import SpeakerHandler
 logger = logging.getLogger(__name__)
 
 
-def init_handlers(config: Config, shm_config: SharedMemoryConfig) -> list[BaseHandler]:
+def init_handlers(
+    config: Config,
+    shm_config: SharedMemoryConfig,
+    ack_queue: "Optional[mp.Queue]" = None,
+) -> list[BaseHandler]:
     """
     Factory function to instantiate and return enabled handlers.
     """
@@ -19,7 +25,7 @@ def init_handlers(config: Config, shm_config: SharedMemoryConfig) -> list[BaseHa
 
     # 1. Visualization
     if config.envs.enable_monitor:
-        handlers.append(MonitorHandler(config, shm_config))
+        handlers.append(MonitorHandler(config, shm_config, ack_queue=ack_queue))
         logger.info("Handler Registered: Monitor")
 
     # 2. Smart Plug Control

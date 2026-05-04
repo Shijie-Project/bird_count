@@ -71,13 +71,13 @@ class _InternalMonitorRenderer:
                 continue
 
             slices, coords = self.roi_map[sid]
-            # Zero-copy fetch from SHM
+            # Zero-copy fetch from SHM (safe because ResultProcess holds the buffer
+            # in READING state until we ack on the ack_queue).
             frame = shm_client.frames[sid, res.buffer_idx]
             resized = cv2.resize(frame, (self.tile_w, self.tile_h))
             if self.rgb_to_bgr:
                 resized = resized[..., ::-1]
 
-            # Fast RGB to BGR flip
             self.canvas[slices[0], slices[1]] = resized
             self._draw_overlay(res, coords)
 
@@ -137,14 +137,24 @@ class _InternalMonitorRenderer:
 
 
 class DisplayProcess(mp.Process):
-    def __init__(self, config, shm_config, display_queue):
+    def __init__(self, config, shm_config, display_queue, ack_queue):
         super().__init__(name="Monitor", daemon=True)
         self.config = config
         self.shm_config = shm_config
         self.display_queue = display_queue
+        self.ack_queue = ack_queue
+
+    def _ack(self, pairs):
+        """Send buffer indices back to ResultProcess so it can release SHM."""
+        if not pairs or self.ack_queue is None:
+            return
+        try:
+            self.ack_queue.put_nowait(pairs)
+        except queue.Full:
+            # Drop the ack — ResultProcess will force-release after timeout.
+            logger.debug(f"[{self.name}] ack_queue full; relying on stale-ack sweep.")
 
     def run(self):
-        # Only import and connect within the child process
         shm_client = SharedMemoryClient(self.shm_config)
         shm_client.connect()
         renderer = _InternalMonitorRenderer(self.config)
@@ -153,11 +163,21 @@ class DisplayProcess(mp.Process):
         while True:
             try:
                 batch = self.display_queue.get(timeout=1.0)
-                renderer.render_batch(batch, shm_client)
             except queue.Empty:
                 continue
             except Exception as e:
+                logger.error(f"[{self.name}] Queue error: {e}")
+                continue
+
+            pairs = list(zip(batch.stream_ids, batch.buffer_indices))
+            try:
+                renderer.render_batch(batch, shm_client)
+            except Exception as e:
                 logger.error(f"[{self.name}] Render error: {e}")
+            finally:
+                # CRITICAL: always ack so the SHM buffer can be reclaimed,
+                # otherwise stale-ack sweep has to clean up.
+                self._ack(pairs)
 
 
 class MonitorHandler(BaseHandler):
@@ -166,34 +186,48 @@ class MonitorHandler(BaseHandler):
     the heavy UI in a separate process.
     """
 
-    def __init__(self, config: Config, shm_config: SharedMemoryConfig, name="Monitor"):
+    def __init__(
+        self, config: Config, shm_config: SharedMemoryConfig, ack_queue: Optional[mp.Queue] = None, name="Monitor"
+    ):
+        # needs_frames=False because the *handler* itself does not touch SHM in-process.
+        # The DisplayProcess is what reads SHM, and we now coordinate that via ack_queue.
         super().__init__(name=name, needs_frames=False)
         self.config = config
         self.shm_config = shm_config
+        self.ack_queue = ack_queue
         self.display_queue: Optional[mp.Queue] = None
         self.proc: Optional[mp.Process] = None
 
     def start(self):
         self.display_queue = mp.Queue(maxsize=5)
 
-        self.proc = DisplayProcess(self.config, self.shm_config, self.display_queue)
+        self.proc = DisplayProcess(self.config, self.shm_config, self.display_queue, self.ack_queue)
         self.proc.start()
 
         logger.info("[Monitor] Background display process started.")
 
     def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
-        # This is skipped because we override handle_batch
+        # Overridden by handle_batch
         pass
 
-    def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient):
-        """Simply forwards the metadata. High speed, no blocking."""
-        if self.display_queue:
-            try:
-                self.display_queue.put_nowait(batch_result)
-            except queue.Full:
-                pass
+    def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient) -> set[tuple[int, int]]:
+        """
+        Forward metadata to DisplayProcess. If we successfully enqueue, claim the
+        (sid, buffer_idx) pairs so ResultProcess defers the SHM release until
+        DisplayProcess acks. On Queue.Full we do NOT claim — caller releases
+        immediately and the frame is simply dropped from the dashboard.
+        """
+        if not self.display_queue or not batch_result.results:
+            return set()
+        try:
+            self.display_queue.put_nowait(batch_result)
+        except queue.Full:
+            return set()
+        return set(zip(batch_result.stream_ids, batch_result.buffer_indices))
 
     def stop(self):
         if self.proc:
             self.proc.terminate()
-            self.proc.join()
+            self.proc.join(timeout=1.0)
+            if self.proc.is_alive():
+                self.proc.kill()

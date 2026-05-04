@@ -40,6 +40,11 @@ class TaskDispatcher:
         queue_size = self.config.envs.num_workers_per_gpu * 10
         self.result_queue = mp.Queue(maxsize=queue_size)
 
+        # Back-channel for asynchronous handlers (e.g. MonitorHandler -> DisplayProcess)
+        # to ack buffer indices once they've finished reading from SHM. Unbounded because
+        # acks are tiny and rare; ResultProcess drains this each loop iteration.
+        self.ack_queue = mp.Queue()
+
         # Resource Management
         self.shm_manager: Optional[SharedMemoryManager] = None
 
@@ -73,8 +78,13 @@ class TaskDispatcher:
             logger.info(f"[{self.name}] Initializing system components...")
 
             # A. Result Consumer (Sink)
-            self.consumer = ResultProcess(config=self.config, shm_config=shm_config, result_queue=self.result_queue)
-            for handler in init_handlers(self.config, shm_config):
+            self.consumer = ResultProcess(
+                config=self.config,
+                shm_config=shm_config,
+                result_queue=self.result_queue,
+                ack_queue=self.ack_queue,
+            )
+            for handler in init_handlers(self.config, shm_config, ack_queue=self.ack_queue):
                 self.consumer.register_handler(handler)
 
             # B. Multiple Inference Engines (Workers)

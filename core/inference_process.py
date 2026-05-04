@@ -96,6 +96,10 @@ class InferenceProcess(mp.Process):
         self._colormap_lut = None
         self._interval = config.frame_interval
 
+        # Pre-allocated pinned host buffer for fast async D2H of the visualization tensor.
+        # Initialized in _init_resource() once we know we are running with CUDA + density map.
+        self._pinned_vis = None
+
     def _init_resource(self):
         """Initializes GPU and SHM resources within the child process context."""
         try:
@@ -132,6 +136,19 @@ class InferenceProcess(mp.Process):
             self.shm_client.connect()
 
             self._colormap_lut = create_colormap_lut().to(self.device)
+
+            # Pinned host staging buffer for the largest expected visualization batch.
+            # Pinned memory enables true async DMA on cuda streams, ~1.5-2x faster D2H
+            # for the multi-MB visualization tensor.
+            if self.device.type == "cuda" and self.config.envs.show_density_map:
+                max_b = max(1, len(self.assigned_streams))
+                H, W, C = self.shm_config.shape[2:]
+                self._pinned_vis = torch.empty((max_b, H, W, C), dtype=torch.uint8, pin_memory=True)
+                logger.info(
+                    f"[{self.name}] Allocated pinned D2H buffer: ({max_b}, {H}, {W}, {C}) uint8 "
+                    f"({self._pinned_vis.numel() / (1024 * 1024):.1f} MB)"
+                )
+
             self._warmup_gpu()
 
             logger.info(f"[{self.name}] Initialization complete. Ready for streams {self.assigned_streams}")
@@ -141,10 +158,15 @@ class InferenceProcess(mp.Process):
             raise
 
     def _warmup_gpu(self):
-        """Warmup largest expected batch sizes to prevent startup latency spikes."""
-        logger.info(f"[{self.name}] Starting GPU Warmup...")
+        """
+        Warmup every batch size from 1 .. max_assigned so cudnn.benchmark autotune
+        does not stall the first runtime batch of any partial-batch size.
+        """
         max_bsz = len(self.assigned_streams)
-        warmup_sizes = sorted({max(1, max_bsz - i) for i in range(3)})
+        if max_bsz <= 0:
+            return
+        warmup_sizes = list(range(1, max_bsz + 1))
+        logger.info(f"[{self.name}] Starting GPU Warmup for batch sizes {warmup_sizes}...")
 
         with torch.inference_mode():
             for bsz in warmup_sizes:
@@ -283,13 +305,28 @@ class InferenceProcess(mp.Process):
                             blended_gpu = self._apply_overlays_on_gpu(density_map, raw_tensor)
 
                     # --- 4. Data Transfer (D2H) ---
-                    # Move counts to CPU (Tiny transfer, fast)
+                    # Issue the large async D2H first so it overlaps the (synchronous)
+                    # counts transfer that follows. Both run on the current CUDA stream,
+                    # so the .cpu() call below also flushes the pinned copy.
+                    pinned_view = None
+                    if self.config.envs.show_density_map:
+                        if self._pinned_vis is not None:
+                            n = len(sids)
+                            pinned_view = self._pinned_vis[:n]
+                            pinned_view.copy_(blended_gpu, non_blocking=True)
+
+                    # Move counts to CPU (tiny transfer; this also serializes the prior
+                    # non_blocking copy because both use the same default stream).
                     counts_cpu = counts_tensor.cpu().numpy()
 
-                    # Move visualization frames to SHM (Large transfer, slow)
+                    # Move visualization frames to SHM
                     if self.config.envs.show_density_map:
-                        # Async copy back to SHM slice
-                        self.shm_client.frames[sids, b_idxs] = blended_gpu.cpu().numpy()  # RGB
+                        if pinned_view is not None:
+                            # Pinned numpy view -> SHM. PCIe DMA already done.
+                            self.shm_client.frames[sids, b_idxs] = pinned_view.numpy()
+                        else:
+                            # CPU fallback (no pinned buffer when not running on CUDA)
+                            self.shm_client.frames[sids, b_idxs] = blended_gpu.cpu().numpy()
 
                     t2 = time.perf_counter()
                     process_time = time.time()
