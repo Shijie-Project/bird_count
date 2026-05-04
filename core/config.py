@@ -119,6 +119,10 @@ class EnvSettings(BaseSettings):
 
     enable_trigger_gui: bool = True
 
+    # Hold-down delay (seconds): a stream's count must remain above its threshold
+    # continuously for this long before the alert fires. Acts as a debounce/cooldown.
+    alert_trigger_delay: float = 5.0
+
     show_density_map: bool = True
 
     # Pydantic V2 config

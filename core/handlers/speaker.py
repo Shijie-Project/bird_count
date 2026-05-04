@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -13,6 +14,32 @@ from .base import BaseHandler, InferenceResult
 logger = logging.getLogger(__name__)
 
 
+class SpeakerClient:
+    """Custom Client for Industrial Speakers."""
+
+    def __init__(self, ip: str):
+        self.ip = ip
+        self.auth = httpx.BasicAuth("admin", "admin")
+        self.base_url = f"http://{ip}/cgi-bin"
+
+    async def play_audio(self, client: httpx.AsyncClient, filename: str = "7MB.wav"):
+        url = f"{self.base_url}/audio_play?name={filename}&action=start&time=1"
+        response = await client.get(url)
+        response.raise_for_status()
+        return response
+
+    async def stop_audio(self, client: httpx.AsyncClient, filename: str = "7MB.wav"):
+        url = f"{self.base_url}/audio_play?name={filename}&action=stop&time=1"
+        response = await client.get(url)
+        response.raise_for_status()
+        return response
+
+    async def get_status(self, client: httpx.AsyncClient) -> str:
+        url = f"{self.base_url}/audio_get_status"
+        response = await client.get(url)
+        return response.text
+
+
 class SpeakerHandler(BaseHandler):
     """
     High-performance Async Speaker Handler using httpx.
@@ -20,7 +47,7 @@ class SpeakerHandler(BaseHandler):
     Behavior Logic:
     - Sets needs_frames to False to eliminate SHM overhead.
     - Uses asyncio + httpx to handle non-blocking audio broadcasts.
-    - Implements a "Trigger-and-Loop" pattern until manual stop.
+    - Implements a "Trigger-and-Loop" pattern until manual stop OR cancel_all().
     """
 
     def __init__(self, config: Config, name: str = "Speaker"):
@@ -29,14 +56,14 @@ class SpeakerHandler(BaseHandler):
         if not self.enable:
             return
 
-        # 1. Simplified Mapping: Stream ID -> Set of associated Speaker IPs
         self.stream_to_speakers: dict[int, set[str]] = {sid: zone.speakers for sid, zone in config.sid_to_zone.items()}
 
-        # 2. State Machine: READY (Idle), ACTIVE (Broadcasting Loop)
         all_unique_ips = {ip for ips in self.stream_to_speakers.values() for ip in ips}
         self.device_states: dict[str, str] = dict.fromkeys(all_unique_ips, "READY")
 
-        # 3. ThreadPool for running the asyncio event loops per device
+        self._state_lock = threading.Lock()
+        self.cancel_events: dict[str, threading.Event] = {ip: threading.Event() for ip in all_unique_ips}
+
         self._executor = None
         logger.info(f"[{self.name}] Async Handler initialized for {len(all_unique_ips)} devices.")
 
@@ -50,19 +77,18 @@ class SpeakerHandler(BaseHandler):
         return self._executor
 
     def handle(self, result: InferenceResult, frame: Optional[object]):
-        """
-        Entry point for inference results. Frame is None.
-        """
-        # OPTIMIZATION: Respond directly to pre-calculated alert flags.
+        """Entry point for inference results. Frame is None."""
         if not result.alert_flag:
             return
 
         target_ips = self.stream_to_speakers.get(result.stream_id, [])
         for ip in target_ips:
-            # Double-check state before entering lock to reduce contention
-            if self.device_states.get(ip) == "READY":
+            with self._state_lock:
+                if self.device_states.get(ip) != "READY":
+                    continue
                 self.device_states[ip] = "ACTIVE"
-                self.executor.submit(self._run_async_lifecycle, ip)
+                self.cancel_events[ip].clear()
+            self.executor.submit(self._run_async_lifecycle, ip)
 
     def _run_async_lifecycle(self, ip: str):
         """Bridge between ThreadPool and Asyncio loop."""
@@ -71,44 +97,73 @@ class SpeakerHandler(BaseHandler):
         except Exception as e:
             logger.error(f"[{self.name}] Async lifecycle error on {ip}: {e}")
         finally:
-            self.device_states[ip] = "READY"
+            with self._state_lock:
+                self.device_states[ip] = "READY"
+                self.cancel_events[ip].clear()
             logger.info(f"[{self.name}] {ip} cycle finished. Returned to READY state.")
 
     async def _async_broadcast_task(self, ip: str):
         """
-        Native Async Loop using httpx.
-        Loops until manual stop or safety timeout.
+        Native Async Loop using httpx. Loops until manual stop, cancel signal, or safety timeout.
         """
-        # API credentials and URL (assuming default admin:admin for industrial speakers)
-        auth = httpx.BasicAuth("admin", "admin")
-        url = f"http://{ip}/cgi-bin/audio_play?name=7MB.wav&action=start&time=1"
+        speaker = SpeakerClient(ip)
+        cancel_event = self.cancel_events[ip]
+        loop = asyncio.get_running_loop()
 
-        # Use a safety duration to prevent infinite loops (1 hour)
         start_time = time.time()
         max_duration = 3600
 
-        # httpx AsyncClient handles connection pooling automatically
-        async with httpx.AsyncClient(auth=auth, timeout=5.0) as client:
+        async with httpx.AsyncClient(auth=speaker.auth, timeout=5.0) as client:
             while (time.time() - start_time) < max_duration:
+                # Check cancel before issuing a play.
+                if cancel_event.is_set():
+                    break
+
                 try:
-                    # A. Trigger Playback
-                    response = await client.get(url)
-                    response.raise_for_status()
-
-                    # B. Polling Interval
-                    # We wait 10 seconds between play commands.
-                    # This is also where you'd check for a 'manual stop' signal if available.
-                    await asyncio.sleep(10.0)
-
-                    # C. [OPTIONAL] Check for manual stop signal via a status API
-                    # status_resp = await client.get(f"http://{ip}/cgi-bin/audio_get_status")
-                    # if "stopped" in status_resp.text: break
-
+                    await speaker.play_audio(client)
                 except httpx.HTTPError as e:
                     logger.warning(f"[{self.name}] Network error on {ip}: {e}. Retrying in 10s...")
-                    await asyncio.sleep(10.0)
+
+                # Sleep up to 10s but wake immediately on cancel.
+                cancelled = await loop.run_in_executor(None, cancel_event.wait, 10.0)
+                if cancelled:
+                    break
+
+                # Optional: detect a manual stop via the speaker's status endpoint.
+                try:
+                    status = await speaker.get_status(client)
+                    if "stopped" in status.lower() or "idle" in status.lower():
+                        logger.info(f"[{self.name}] Manual stop detected on {ip}. Exiting broadcast.")
+                        return
+                except Exception:
+                    pass  # Status endpoint optional; ignore failures.
+
+            # Always issue an explicit stop on the way out (cancel or timeout).
+            try:
+                await speaker.stop_audio(client)
+                logger.info(f"[{self.name}] {ip} broadcast stopped.")
+            except Exception as e:
+                logger.error(f"[{self.name}] Failed to stop audio on {ip}: {e}")
+
+    def cancel_all(self):
+        """Signal every active speaker to abort and stop broadcasting."""
+        if not self.enable:
+            return
+        with self._state_lock:
+            active_ips = [ip for ip, st in self.device_states.items() if st == "ACTIVE"]
+            for ip in active_ips:
+                self.cancel_events[ip].set()
+        if active_ips:
+            logger.info(f"[{self.name}] cancel_all() signalled {len(active_ips)} active speaker(s): {active_ips}")
+
+    def get_active_devices(self) -> set[str]:
+        if not self.enable:
+            return set()
+        with self._state_lock:
+            return {ip for ip, st in self.device_states.items() if st == "ACTIVE"}
 
     def stop(self):
         """Cleanup handler resources."""
         if self.enable:
+            self.cancel_all()
             self.executor.shutdown(wait=False)

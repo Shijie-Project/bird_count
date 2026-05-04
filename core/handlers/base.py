@@ -65,3 +65,11 @@ class BaseHandler(ABC):
     def stop(self):
         """Optional hook called when Consumer process stops."""
         pass
+
+    def cancel_all(self):
+        """Abort any in-flight per-device alert lifecycles. Default: no-op."""
+        pass
+
+    def get_active_devices(self) -> set[str]:
+        """Return the set of device identifiers currently in an active alert state."""
+        return set()
