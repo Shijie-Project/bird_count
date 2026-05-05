@@ -21,19 +21,29 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+THRESHOLDS = [100, 125, 1e9]
+COLORS = [(0, 255, 0), (0, 165, 255), (0, 0, 255)]
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Bird density video inference")
     parser.add_argument("--input", "-i", type=str, required=True, help="input video path")
-    parser.add_argument("--mask-image", type=str, default=None, help="mask image path; black pixels = masked region")
-    parser.add_argument("--batch-size", type=int, default=32, help="batch size for inference")
+    parser.add_argument(
+        "--mask-image", "-m", type=str, default=None, help="mask image path; black pixels = masked region"
+    )
+    parser.add_argument("--batch-size", type=int, default=64, help="batch size for inference")
     parser.add_argument("--seconds", type=float, default=None, help="only process this many seconds of video")
     parser.add_argument("--device", default="0", help="cuda device index, e.g. 0")
     parser.add_argument("--no-amp", action="store_true", help="disable mixed precision on CUDA")
     parser.add_argument(
-        "--video-mode",
-        default="split",
+        "--high-hold-seconds",
+        type=float,
+        default=3.0,
+        help="hold the high-threshold contour color for this many seconds after a trigger",
+    )
+    parser.add_argument(
+        "--mode",
+        default="overlay",
         choices=["pure", "overlay", "split"],
         help="output video type: overlay / pure density map / split side-by-side",
     )
@@ -58,14 +68,6 @@ def colorize_density(density_2d, target_w, target_h):
     normed = cv2.resize(normed, (target_w, target_h))
     heatmap = cv2.applyColorMap((normed * 255).astype(np.uint8), cv2.COLORMAP_JET)
     return heatmap, normed
-
-
-def density_color(pred_count):
-    if pred_count < 100:
-        return (0, 255, 0)  # green: low
-    if pred_count < 110:
-        return (0, 165, 255)  # orange: warn
-    return (0, 0, 255)  # red: danger
 
 
 def load_static_mask(mask_path, target_w, target_h):
@@ -103,11 +105,11 @@ def run_video(args, model, device):
         black_mask, mask_contours = load_static_mask(args.mask_image, w, h)
 
     base, _ = os.path.splitext(args.input)
-    suffix = {"overlay": "_overlay", "pure": "_pure", "split": "_split"}[args.video_mode]
+    suffix = {"overlay": "_overlay", "pure": "_pure", "split": "_split"}[args.mode]
     out_path = base + suffix + ".mp4"
 
-    out_w = w * 2 if args.video_mode == "split" else w
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_w = w * 2 if args.mode == "split" else w
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # noqa
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, h))
     if not writer.isOpened():
         cap.release()
@@ -116,7 +118,7 @@ def run_video(args, model, device):
     print(f"Video: {args.input}  ({w}x{h} @ {fps:.1f}fps, {total_frames} frames)")
     print(f"Mask image: {args.mask_image}")
     print(f"Batch size: {args.batch_size}")
-    print(f"Output: {out_path}  mode={args.video_mode}")
+    print(f"Output: {out_path}  mode={args.mode}")
 
     mean = IMAGENET_MEAN.to(device)
     std = IMAGENET_STD.to(device)
@@ -127,6 +129,16 @@ def run_video(args, model, device):
     pred_counts = []
     frame_idx = 0
     log_every = max(int(round(fps)), 1)
+
+    high_tier = len(COLORS) - 1
+    hold_frames_total = max(0, int(round(args.high_hold_seconds * fps)))
+    hold_state = {"remaining": 0}
+
+    def tier_for(count):
+        for i, t in enumerate(THRESHOLDS):
+            if count <= t:
+                return i
+        return high_tier
 
     def flush():
         if not frame_buffer:
@@ -148,12 +160,21 @@ def run_video(args, model, device):
             pred_counts.append(pred_count)
             orig_frame = orig_buffer[j]
 
-            if args.video_mode == "pure":
+            tier = tier_for(pred_count)
+            if tier == high_tier:
+                hold_state["remaining"] = hold_frames_total
+            if hold_state["remaining"] > 0:
+                contour_color = COLORS[high_tier]
+                hold_state["remaining"] -= 1
+            else:
+                contour_color = COLORS[tier]
+
+            if args.mode == "pure":
                 heatmap, _ = colorize_density(maps[j], w, h)
                 writer.write(heatmap)
                 continue
 
-            if args.video_mode == "split":
+            if args.mode == "split":
                 heatmap, _ = colorize_density(maps[j], w, h)
                 writer.write(np.concatenate([orig_frame, heatmap], axis=1))
                 continue
@@ -167,7 +188,7 @@ def run_video(args, model, device):
             if heat_mask.any():
                 overlay_frame[heat_mask] = cv2.addWeighted(orig_frame[heat_mask], 0.5, heatmap[heat_mask], 0.5, 0)
             if mask_contours is not None:
-                cv2.drawContours(overlay_frame, mask_contours, -1, density_color(pred_count), thickness=3)
+                cv2.drawContours(overlay_frame, mask_contours, -1, contour_color, thickness=3)
             cv2.putText(
                 overlay_frame,
                 f"Est: {pred_count:.1f}",
