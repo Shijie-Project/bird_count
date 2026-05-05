@@ -14,6 +14,16 @@ from ..memory_manager import SharedMemoryClient, SharedMemoryConfig
 from .base import BaseHandler, BatchInferenceResult, InferenceResult
 
 
+try:
+    import tkinter as tk
+
+    root = tk.Tk()
+    SCREEN_W, SCREEN_H = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.destroy()
+except Exception:
+    SCREEN_W, SCREEN_H = 1920, 1080  # fallback
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,19 +35,21 @@ class _InternalMonitorRenderer:
     # --- Style Config (Static constants for cache efficiency) ---
     COLOR_GRID = (50, 50, 50)
     COLOR_BG_BAR = (0, 0, 0)
+    COLOR_BG_ALERT = (0, 0, 255)
     COLOR_TEXT_NORMAL = (0, 255, 0)
     COLOR_TEXT_ALERT = (255, 255, 255)
-    COLOR_BG_ALERT = (0, 0, 255)
 
     FONT = cv2.FONT_HERSHEY_DUPLEX
     FONT_SCALE = 0.6
     FONT_THICKNESS = 1
 
-    # Target display resolution
-    SCREEN_W, SCREEN_H = 1920, 1080
+    # Reserve room for the OS title bar / taskbar so the bottom row of tiles
+    # doesn't get clipped off the visible desktop.
+    CHROME_MARGIN_W = 20
+    CHROME_MARGIN_H = 80
 
     def __init__(self, config: Config, window_name="Bird Detection Dashboard", name="Monitor"):
-        self.rgb_to_bgr = config.envs.show_density_map and not config.envs.monitor_only
+        self.rgb_to_bgr = config.envs.show_density_map
         self.window_name = window_name
         self.name = name
         self.num_streams = config.num_streams
@@ -46,11 +58,17 @@ class _InternalMonitorRenderer:
         self._last_ui_update = 0
         self._ui_update_interval = 1.0 / 25.0
 
-        # Layout calculation
+        # Layout: square-ish grid, fit inside the visible desktop area.
+        usable_w = max(320, SCREEN_W - self.CHROME_MARGIN_W)
+        usable_h = max(240, SCREEN_H - self.CHROME_MARGIN_H)
         self.cols = int(math.ceil(math.sqrt(self.num_streams)))
         self.rows = int(math.ceil(self.num_streams / self.cols))
-        self.tile_w = self.SCREEN_W // self.cols
-        self.tile_h = self.SCREEN_H // self.rows
+        self.tile_w = usable_w // self.cols
+        self.tile_h = usable_h // self.rows
+
+        # Initial window dimensions (the user can still drag-resize at runtime).
+        self.window_w = self.cols * self.tile_w
+        self.window_h = self.rows * self.tile_h
 
         self.canvas = np.zeros((self.rows * self.tile_h, self.cols * self.tile_w, 3), dtype=np.uint8)
         self.roi_map = [
@@ -84,9 +102,16 @@ class _InternalMonitorRenderer:
         # Throttled Window Refresh
         if now - self._last_ui_update >= self._ui_update_interval:
             if not self.is_window_setup:
-                cv2.namedWindow(self.window_name, cv2.WINDOW_FULLSCREEN)
+                # WINDOW_NORMAL = user can drag-resize; WINDOW_KEEPRATIO preserves
+                # aspect ratio so tiles don't stretch when the user resizes.
+                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                cv2.resizeWindow(self.window_name, self.window_w, self.window_h)
                 cv2.moveWindow(self.window_name, 0, 0)
                 self._disable_window_close_button()
+                # Pop to the front once on first show so the user notices the
+                # monitor turned on; afterwards it behaves like a normal window
+                # and can be hidden behind other apps.
+                self._force_foreground()
                 self.is_window_setup = True
 
             cv2.imshow(self.window_name, self.canvas)
@@ -135,6 +160,36 @@ class _InternalMonitorRenderer:
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to disable close button: {e}")
 
+    def _force_foreground(self):
+        """Pop the dashboard to the front *once* (Windows only).
+
+        We briefly mark the window TOPMOST to push it above everything, then
+        immediately clear that flag so it behaves like an ordinary window and
+        the user can cover it with other apps afterwards.
+        """
+        if platform.system() != "Windows":
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, self.window_name)  # noqa
+            if not hwnd:
+                return
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE in case it was minimized
+            # Flash to the top of Z-order, then drop topmost so it doesn't stay pinned.
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+            user32.SetForegroundWindow(hwnd)
+        except Exception as e:
+            logger.debug(f"[{self.name}] force_foreground failed: {e}")
+
 
 class DisplayProcess(mp.Process):
     def __init__(self, config, shm_config, display_queue, ack_queue):
@@ -182,12 +237,20 @@ class DisplayProcess(mp.Process):
 
 class MonitorHandler(BaseHandler):
     """
-    Proxy Handler that looks like a normal handler but runs
-    the heavy UI in a separate process.
+    Proxy Handler that looks like a normal handler but runs the heavy UI in a
+    separate process.
+
+    Runtime-toggleable: enable() / disable() spawn or terminate the DisplayProcess
+    on demand. The initial state is taken from config.envs.enable_monitor; after
+    that, the GUI controls the state.
     """
 
     def __init__(
-        self, config: Config, shm_config: SharedMemoryConfig, ack_queue: Optional[mp.Queue] = None, name="Monitor"
+        self,
+        config: Config,
+        shm_config: SharedMemoryConfig,
+        ack_queue: Optional[mp.Queue] = None,
+        name="Monitor",
     ):
         # needs_frames=False because the *handler* itself does not touch SHM in-process.
         # The DisplayProcess is what reads SHM, and we now coordinate that via ack_queue.
@@ -197,14 +260,61 @@ class MonitorHandler(BaseHandler):
         self.ack_queue = ack_queue
         self.display_queue: Optional[mp.Queue] = None
         self.proc: Optional[mp.Process] = None
+        self._enabled = False
+        self._started = False
 
-    def start(self):
+    def _spawn_display(self):
+        """Start the DisplayProcess if it isn't already running."""
+        if self.proc is not None and self.proc.is_alive():
+            return
         self.display_queue = mp.Queue(maxsize=5)
-
         self.proc = DisplayProcess(self.config, self.shm_config, self.display_queue, self.ack_queue)
         self.proc.start()
-
         logger.info("[Monitor] Background display process started.")
+
+    def _terminate_display(self):
+        """Tear the DisplayProcess down. Safe to call when nothing is running."""
+        proc = self.proc
+        self.proc = None
+        self.display_queue = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.join(timeout=1.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=0.5)
+            logger.info("[Monitor] Background display process stopped.")
+        except Exception as e:
+            logger.error(f"[Monitor] Error terminating display: {e}")
+
+    def start(self):
+        """Lifecycle hook fired when ResultProcess starts up."""
+        super().start()
+        self._started = True
+        if self._enabled:
+            self._spawn_display()
+
+    def enable(self) -> bool:
+        """Turn the monitor ON. Spawns the DisplayProcess if needed."""
+        if self._enabled:
+            return True
+        self._enabled = True
+        if self._started:
+            self._spawn_display()
+        return True
+
+    def disable(self) -> bool:
+        """Turn the monitor OFF. Terminates the DisplayProcess if running."""
+        if not self._enabled:
+            return False
+        self._enabled = False
+        self._terminate_display()
+        return False
+
+    def is_enabled(self) -> bool:
+        return self._enabled
 
     def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
         # Overridden by handle_batch
@@ -214,10 +324,10 @@ class MonitorHandler(BaseHandler):
         """
         Forward metadata to DisplayProcess. If we successfully enqueue, claim the
         (sid, buffer_idx) pairs so ResultProcess defers the SHM release until
-        DisplayProcess acks. On Queue.Full we do NOT claim — caller releases
-        immediately and the frame is simply dropped from the dashboard.
+        DisplayProcess acks. On Queue.Full or when disabled we do NOT claim —
+        caller releases immediately and the frame is simply dropped.
         """
-        if not self.display_queue or not batch_result.results:
+        if not self._enabled or self.display_queue is None or not batch_result.results:
             return set()
         try:
             self.display_queue.put_nowait(batch_result)
@@ -226,8 +336,4 @@ class MonitorHandler(BaseHandler):
         return set(zip(batch_result.stream_ids, batch_result.buffer_indices))
 
     def stop(self):
-        if self.proc:
-            self.proc.terminate()
-            self.proc.join(timeout=1.0)
-            if self.proc.is_alive():
-                self.proc.kill()
+        self._terminate_display()

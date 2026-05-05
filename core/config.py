@@ -6,7 +6,7 @@ from typing import Literal, Optional
 
 import torch
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -76,7 +76,13 @@ class ZoneConfig(BaseModel):
     speakers: list[str] = Field(default_factory=list)
     smart_plugs: list[str] = Field(default_factory=list)
 
-    threshold: int = 60
+    thresholds: int | list[int] = 60
+
+    @model_validator(mode="after")
+    def post_init(self) -> "ZoneConfig":
+        if isinstance(self.thresholds, int):
+            self.thresholds = [self.thresholds] * len(self.cameras)
+        return self
 
 
 class SmartPlugAuthConfig(BaseModel):
@@ -93,6 +99,7 @@ class EnvSettings(BaseSettings):
     """
 
     debug: bool = False
+    verbose_debug: bool = False
 
     model_path: str = None
     image_height: int = 720
@@ -118,24 +125,32 @@ class EnvSettings(BaseSettings):
     enable_smart_plug: bool = True
     enable_speaker: bool = True
 
-    monitor_only: bool = False
+    monitor_mode: bool = False
+    show_density_map: bool = True
 
     tapo_email: str = None
     tapo_password: str = None
 
-    enable_trigger_gui: bool = True
-
     # Hold-down delay (seconds): a stream's count must remain above its threshold
     # continuously for this long before the alert fires. Acts as a debounce/cooldown.
     alert_trigger_delay: float = 5.0
-
-    show_density_map: bool = True
 
     # Audit log path (JSONL). Empty string disables auditing.
     audit_log_path: str = "logs/audit.jsonl"
 
     # Pydantic V2 config
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @model_validator(mode="after")
+    def post_init(self) -> "EnvSettings":
+        if self.monitor_mode:
+            self.enable_monitor = True
+            self.show_density_map = False
+
+        if self.verbose_debug:
+            self.debug = True
+
+        return self
 
 
 class Config:
@@ -151,7 +166,7 @@ class Config:
         self._validate_envs(envs)
 
         # 1. Initialize Sub-Configs
-        # In monitor_only mode we never load a model, so model_path is allowed to be empty.
+        # In monitor_mode we never load a model, so model_path is allowed to be empty.
         if envs.model_path:
             self.model = ModelConfig(path=Path(envs.model_path))
         else:
@@ -180,11 +195,11 @@ class Config:
     def _validate_envs(envs: EnvSettings):
         """Pre-flight validation. Raises ConfigError with actionable messages."""
         # 1. model_path must be present unless we are in monitor-only mode.
-        if not envs.monitor_only and not envs.model_path:
+        if not envs.monitor_mode and not envs.model_path:
             raise ConfigError(
-                "model_path is required when monitor_only=False. "
+                "model_path is required when monitor_mode=False. "
                 "Set MODEL_PATH in your .env file (or environment) "
-                "or run with MONITOR_ONLY=True for the no-inference dashboard."
+                "or run with MONITOR_MODE=True for the no-inference dashboard."
             )
 
         # 2. If a model_path is provided, the file should exist (warn-not-fail to allow
@@ -301,13 +316,13 @@ class Config:
                 z_cams = getattr(zone, "cameras", [])
                 z_speakers = getattr(zone, "speakers", [])
                 z_plugs = getattr(zone, "smart_plugs", "N/A")
-                z_thresh = getattr(zone, "threshold", "Global")
+                z_thresh = getattr(zone, "thresholds", "N/A")
 
                 logger.info(f"  + Zone {i}: {z_name}")
                 logger.info(f"    |-- Cameras   : {z_cams}")
                 logger.info(f"    |-- Speakers   : {z_speakers}")
                 logger.info(f"    |-- SmartPlugs : {z_plugs}")
-                logger.info(f"    |-- Threshold : {z_thresh}")
+                logger.info(f"    |-- Thresholds : {z_thresh}")
                 logger.info("")
 
         logger.info("=" * 40)
@@ -325,6 +340,20 @@ class Config:
                 sid += 1
         self._sid_to_zone = sid_to_zone
         return sid_to_zone
+
+    @property
+    def sid_to_threshold(self):
+        if hasattr(self, "_sid_to_threshold"):
+            return self._sid_to_threshold
+
+        sid = 0
+        sid_to_threshold = {}
+        for zone in self.zones:
+            for threshold in zone.thresholds:
+                sid_to_threshold[sid] = threshold
+                sid += 1
+        self._sid_to_threshold = sid_to_threshold
+        return sid_to_threshold
 
     @property
     def sid_to_ip(self):

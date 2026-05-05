@@ -7,6 +7,7 @@ from typing import Optional
 
 import numpy as np
 
+from ..audit import AuditLog
 from ..config import Config
 from .base import BaseHandler, InferenceResult
 
@@ -32,6 +33,10 @@ class SmartPlugHandler(BaseHandler):
 
     def __init__(self, config: Config, name="SmartPlug", max_idle_time=3600):
         super().__init__(name=name, needs_frames=False)
+        # Audit log path is captured up-front; the file is opened in start() (child process).
+        self._audit_log_path = config.envs.audit_log_path
+        self.audit: Optional[AuditLog] = None
+
         self.enable = config.envs.enable_smart_plug
         if not self.enable or ApiClient is None:
             if ApiClient is None and self.enable:
@@ -65,6 +70,13 @@ class SmartPlugHandler(BaseHandler):
             )
         return self._executor
 
+    def start(self):
+        super().start()
+        # Open audit log inside the child process where this handler will run.
+        self.audit = AuditLog(self._audit_log_path, name=self.name)
+        if self.enable and self.audit:
+            self.audit.log("handler.start", handler=self.name, devices=sorted(self.device_states.keys()))
+
     def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
         """Processes a single result. Frame is always None (needs_frames=False)."""
         if not result.alert_flag:
@@ -78,18 +90,35 @@ class SmartPlugHandler(BaseHandler):
                     continue
                 self.device_states[ip] = "ACTIVE"
                 self.cancel_events[ip].clear()
+            if self.audit:
+                self.audit.log(
+                    "device.activate",
+                    handler=self.name,
+                    ip=ip,
+                    stream_id=result.stream_id,
+                    count=result.count,
+                )
             self.executor.submit(self._run_lifecycle, ip)
 
     def _run_lifecycle(self, ip: str):
         """Runs the async monitoring task in a dedicated thread."""
+        error_msg = None
         try:
             asyncio.run(self._async_task(ip))
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"[{self.name}] Task failed for {ip}: {e}")
         finally:
             with self._state_lock:
                 self.device_states[ip] = "READY"
                 self.cancel_events[ip].clear()
+            if self.audit:
+                self.audit.log(
+                    "device.deactivate",
+                    handler=self.name,
+                    ip=ip,
+                    error=error_msg,
+                )
             logger.debug(f"[{self.name}] {ip} reset to READY state.")
 
     async def _async_task(self, ip: str):
@@ -142,6 +171,8 @@ class SmartPlugHandler(BaseHandler):
                 self.cancel_events[ip].set()
         if active_ips:
             logger.info(f"[{self.name}] cancel_all() signalled {len(active_ips)} active plug(s): {active_ips}")
+            if self.audit:
+                self.audit.log("handler.cancel_all", handler=self.name, devices=active_ips)
 
     def get_active_devices(self) -> set[str]:
         if not self.enable:
@@ -155,3 +186,6 @@ class SmartPlugHandler(BaseHandler):
             self.cancel_all()
             self.executor.shutdown(wait=False)
             logger.info(f"[{self.name}] Handler stopped.")
+        if self.audit:
+            self.audit.log("handler.stop", handler=self.name)
+            self.audit.close()

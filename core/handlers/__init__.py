@@ -23,10 +23,10 @@ def init_handlers(
     """
     handlers = []
 
-    # 1. Visualization
-    if config.envs.enable_monitor:
-        handlers.append(MonitorHandler(config, shm_config, ack_queue=ack_queue))
-        logger.info("Handler Registered: Monitor")
+    # 1. Visualization - always register;
+    # the handler is runtime-toggleable via the InteractionGUI.
+    handlers.append(MonitorHandler(config, shm_config, ack_queue=ack_queue))
+    logger.info("Handler Registered: Monitor")
 
     # 2. Smart Plug Control
     if config.envs.enable_smart_plug:

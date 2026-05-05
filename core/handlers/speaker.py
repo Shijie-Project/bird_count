@@ -7,6 +7,7 @@ from typing import Optional
 
 import httpx  # High-performance async HTTP client
 
+from ..audit import AuditLog
 from ..config import Config
 from .base import BaseHandler, InferenceResult
 
@@ -52,6 +53,9 @@ class SpeakerHandler(BaseHandler):
 
     def __init__(self, config: Config, name: str = "Speaker"):
         super().__init__(name=name, needs_frames=False)
+        self._audit_log_path = config.envs.audit_log_path
+        self.audit: Optional[AuditLog] = None
+
         self.enable = config.envs.enable_speaker
         if not self.enable:
             return
@@ -76,6 +80,12 @@ class SpeakerHandler(BaseHandler):
             )
         return self._executor
 
+    def start(self):
+        super().start()
+        self.audit = AuditLog(self._audit_log_path, name=self.name)
+        if self.enable and self.audit:
+            self.audit.log("handler.start", handler=self.name, devices=sorted(self.device_states.keys()))
+
     def handle(self, result: InferenceResult, frame: Optional[object]):
         """Entry point for inference results. Frame is None."""
         if not result.alert_flag:
@@ -88,18 +98,30 @@ class SpeakerHandler(BaseHandler):
                     continue
                 self.device_states[ip] = "ACTIVE"
                 self.cancel_events[ip].clear()
+            if self.audit:
+                self.audit.log(
+                    "device.activate",
+                    handler=self.name,
+                    ip=ip,
+                    stream_id=result.stream_id,
+                    count=result.count,
+                )
             self.executor.submit(self._run_async_lifecycle, ip)
 
     def _run_async_lifecycle(self, ip: str):
         """Bridge between ThreadPool and Asyncio loop."""
+        error_msg = None
         try:
             asyncio.run(self._async_broadcast_task(ip))
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"[{self.name}] Async lifecycle error on {ip}: {e}")
         finally:
             with self._state_lock:
                 self.device_states[ip] = "READY"
                 self.cancel_events[ip].clear()
+            if self.audit:
+                self.audit.log("device.deactivate", handler=self.name, ip=ip, error=error_msg)
             logger.info(f"[{self.name}] {ip} cycle finished. Returned to READY state.")
 
     async def _async_broadcast_task(self, ip: str):
@@ -155,6 +177,8 @@ class SpeakerHandler(BaseHandler):
                 self.cancel_events[ip].set()
         if active_ips:
             logger.info(f"[{self.name}] cancel_all() signalled {len(active_ips)} active speaker(s): {active_ips}")
+            if self.audit:
+                self.audit.log("handler.cancel_all", handler=self.name, devices=active_ips)
 
     def get_active_devices(self) -> set[str]:
         if not self.enable:
@@ -167,3 +191,6 @@ class SpeakerHandler(BaseHandler):
         if self.enable:
             self.cancel_all()
             self.executor.shutdown(wait=False)
+        if self.audit:
+            self.audit.log("handler.stop", handler=self.name)
+            self.audit.close()

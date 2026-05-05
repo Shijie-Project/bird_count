@@ -77,8 +77,7 @@ class InferenceProcess(mp.Process):
         self.total_workers = total_workers
         self._stop_event = mp.Event()
 
-        # 动态获取 monitor_only 配置
-        self.is_monitor_only = getattr(self.config.envs, "monitor_only", False)
+        self.is_monitor_mode = getattr(self.config.envs, "monitor_mode", False)
 
         # --- Stream Partitioning ---
         # Logic: stream_id % total_workers == worker_id
@@ -103,8 +102,8 @@ class InferenceProcess(mp.Process):
     def _init_resource(self):
         """Initializes GPU and SHM resources within the child process context."""
         try:
-            # === Monitor Only 模式短路 ===
-            if self.is_monitor_only:
+            # === Monitor Mode ===
+            if self.is_monitor_mode:
                 logger.info(f"[{self.name}] Running in MONITOR ONLY mode. Bypassing GPU & Model initialization.")
                 self.shm_client = SharedMemoryClient(self.shm_config)
                 self.shm_client.connect()
@@ -239,7 +238,7 @@ class InferenceProcess(mp.Process):
 
         # Vectorized fetching of frames and metadata
         # 性能优化：Monitor Only 模式下跳过庞大的图像数组拷贝
-        batch_frames = None if self.is_monitor_only else self.shm_client.frames[sids, b_idxs]
+        batch_frames = None if self.is_monitor_mode else self.shm_client.frames[sids, b_idxs]
         batch_meta = self.shm_client.metadata[sids, b_idxs]
 
         return batch_frames, batch_meta, sids, b_idxs
@@ -283,7 +282,7 @@ class InferenceProcess(mp.Process):
                     continue
 
                 # --- 分支处理 ---
-                if self.is_monitor_only:
+                if self.is_monitor_mode:
                     t1 = t0
                     t2 = t0
                     process_time = time.time()
@@ -382,7 +381,8 @@ class InferenceProcess(mp.Process):
         infer_ms = (t2 - t1) * 1000
         total_ms = (t3 - t0) * 1000
 
-        logger.debug(
-            f"[{self.name}] Batch={batch_size} | Age={avg_age:.1f}ms | "
-            f"Prep={prep_ms:.1f}ms | Infer={infer_ms:.1f}ms | Total={total_ms:.1f}ms"
-        )
+        if self.config.envs.verbose_debug:
+            logger.debug(
+                f"[{self.name}] Batch={batch_size} | Age={avg_age:.1f}ms | "
+                f"Prep={prep_ms:.1f}ms | Infer={infer_ms:.1f}ms | Total={total_ms:.1f}ms"
+            )

@@ -7,6 +7,7 @@ from typing import Optional
 from .audit import AuditLog
 from .config import Config
 from .handlers import BaseHandler
+from .handlers.monitor import MonitorHandler
 from .inference_process import BatchInferenceResult
 from .memory_manager import BufferState, SharedMemoryClient, SharedMemoryConfig
 from .utils import setup_logging
@@ -48,9 +49,7 @@ class ResultProcess(mp.Process):
         self.handlers: list[BaseHandler] = []
 
         # O(1) Threshold Mapping
-        self.stream_thresholds: dict[int, float] = {
-            sid: zone.threshold for sid, zone in self.config.sid_to_zone.items()
-        }
+        self.stream_thresholds: dict[int, float] = self.config.sid_to_threshold
 
         self.manual_override_streams: set[int] = set()
 
@@ -67,6 +66,10 @@ class ResultProcess(mp.Process):
         # Both are constructed lazily inside run() because file handles can't be pickled.
         self.audit: Optional[AuditLog] = None
         self._prev_alert: dict[int, bool] = {}
+
+        # Cancel-all hooks: registered by the GUIs so cancel_all (which can be
+        # triggered from any GUI) also resets the other GUI's visual state.
+        self._cancel_hooks: list = []
 
     def register_handler(self, handler: BaseHandler):
         """Registers a plugin to process finalized results."""
@@ -115,6 +118,39 @@ class ResultProcess(mp.Process):
 
         # Cancel-all also clears rising-edge state so the next genuine breach is logged.
         self._prev_alert.clear()
+
+        # Notify any registered GUI hooks (e.g. ManualTriggerGUI clears its hijack dots).
+        for hook in self._cancel_hooks:
+            try:
+                hook()
+            except Exception as e:
+                logger.error(f"[{self.name}] cancel_all hook failed: {e}")
+
+    def _find_monitor_handler(self) -> Optional[MonitorHandler]:
+        for h in self.handlers:
+            if isinstance(h, MonitorHandler):
+                return h
+        return None
+
+    def _handle_toggle_monitor(self) -> bool:
+        """GUI callback: flip the MonitorHandler on/off. Returns the new state."""
+        mh = self._find_monitor_handler()
+        if mh is None:
+            return False
+        if mh.is_enabled():
+            new_state = mh.disable()
+            event = "monitor.disable"
+        else:
+            new_state = mh.enable()
+            event = "monitor.enable"
+        logger.info(f"[{self.name}] Monitor toggled -> {'ON' if new_state else 'OFF'}.")
+        if self.audit:
+            self.audit.log(event)
+        return bool(new_state)
+
+    def _get_monitor_enabled(self) -> bool:
+        mh = self._find_monitor_handler()
+        return bool(mh.is_enabled()) if mh is not None else False
 
     def _get_active_devices_snapshot(self) -> dict[str, set[str]]:
         """Aggregate active-device sets across handlers for GUI status display."""
@@ -231,31 +267,50 @@ class ResultProcess(mp.Process):
         for h in self.handlers:
             h.start()
 
-        # 2. Optional GUI Setup
-        gui = None
-        if self.config.envs.enable_trigger_gui:
-            try:
-                from .gui import ManualTriggerGUI
+        # 2. GUI Setup
+        # InteractionGUI (operator-facing): always shown - hosts Cancel All + Monitor toggle.
+        # ManualTriggerGUI (debug-only): shown only when debug=True; reuses the
+        # InteractionGUI's Tk root as a Toplevel so we keep a single Tcl interpreter.
+        interaction_gui = None
+        manual_gui = None
+        try:
+            from .gui import InteractionGUI, ManualTriggerGUI
 
-                gui = ManualTriggerGUI(
+            interaction_gui = InteractionGUI(
+                self.config,
+                on_cancel_all_callback=self._handle_cancel_all,
+                on_toggle_monitor_callback=self._handle_toggle_monitor,
+                monitor_status_provider=self._get_monitor_enabled,
+                status_provider=self._get_active_devices_snapshot,
+            )
+            interaction_gui.setup()
+
+            if self.config.envs.debug:
+                manual_gui = ManualTriggerGUI(
                     self.config,
                     on_trigger_callback=self._handle_manual_trigger,
-                    on_cancel_all_callback=self._handle_cancel_all,
                     status_provider=self._get_active_devices_snapshot,
+                    master=interaction_gui.root,
                 )
-                gui.setup()
-            except ImportError:
-                logger.warning(f"[{self.name}] GUI requested but .gui module not found.")
-            except Exception as e:
-                logger.warning(f"[{self.name}] GUI initialization failed: {e}")
-                gui = None
+                manual_gui.setup()
+                # When Cancel All is pressed (from either GUI), wipe the hijack
+                # indicators on the debug panel too.
+                self._cancel_hooks.append(manual_gui.reset_all_hijacks)
+        except ImportError:
+            logger.warning(f"[{self.name}] .gui module not found.")
+            interaction_gui = manual_gui = None
+        except Exception as e:
+            logger.warning(f"[{self.name}] GUI initialization failed: {e}")
+            interaction_gui = manual_gui = None
 
         # 3. Consumption Loop
         last_stale_sweep = time.time()
         while not self._stop_event.is_set():
-            # Always service GUI + ack queue, even when no results are flowing.
-            if gui:
-                gui.update()
+            # Always service GUIs + ack queue, even when no results are flowing.
+            if interaction_gui:
+                interaction_gui.update()
+            if manual_gui:
+                manual_gui.update()
             self._drain_ack_queue(shm_client)
 
             # Stale-ack sweep at most every second.
@@ -303,8 +358,11 @@ class ResultProcess(mp.Process):
                     self._release_buffers(shm_client, to_release)
 
         # 4. Cleanup Sequence
-        if gui:
-            gui.destroy()
+        # Tear the Toplevel-based debug GUI down before its master root.
+        if manual_gui:
+            manual_gui.destroy()
+        if interaction_gui:
+            interaction_gui.destroy()
 
         for h in self.handlers:
             h.stop()
