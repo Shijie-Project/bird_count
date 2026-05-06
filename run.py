@@ -3,9 +3,9 @@ import multiprocessing as mp
 import sys
 from typing import Optional
 
-from core.config import Config, EnvSettings
-from core.task_dispatcher import TaskDispatcher
-from core.utils import setup_logging
+from runtime.config import Config, EnvSettings
+from runtime.task_dispatcher import TaskDispatcher
+from runtime.utils import setup_logging
 
 
 logger = logging.getLogger("main")
