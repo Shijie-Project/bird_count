@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--checkpoint-dir", default="../ckpts", help="where to write checkpoints")
     g.add_argument("--crop-size", type=int, default=512, help="train crop size (must be divisible by 8)")
     g.add_argument("--batch-size", type=int, default=8)
-    g.add_argument("--num-workers", type=int, default=8)
+    g.add_argument("--num-workers", type=int, default=0)
 
     g = p.add_argument_group("optimization")
     g.add_argument("--lr", type=float, default=1e-5, help="peak learning rate (cosine target)")
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
 
     g = p.add_argument_group("evaluation")
     g.add_argument("--val-epoch", type=int, default=5, help="run validation every N epochs")
-    g.add_argument("--val-start", type=int, default=50, help="first epoch eligible for validation")
+    g.add_argument("--val-start", type=int, default=0, help="first epoch eligible for validation")
 
     g = p.add_argument_group("misc")
     g.add_argument("--seed", type=int, default=42)
