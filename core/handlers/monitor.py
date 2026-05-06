@@ -9,6 +9,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from ..audit import AuditLog
 from ..config import Config
 from ..memory_manager import SharedMemoryClient, SharedMemoryConfig
 from .base import BaseHandler, BatchInferenceResult, InferenceResult
@@ -260,8 +261,13 @@ class MonitorHandler(BaseHandler):
         self.ack_queue = ack_queue
         self.display_queue: Optional[mp.Queue] = None
         self.proc: Optional[mp.Process] = None
-        self._enabled = False
+        self._enabled = bool(getattr(config.envs, "enable_monitor", True))
         self._started = False
+
+        # Per-handler audit log (mirrors SmartPlugHandler / SpeakerHandler pattern).
+        # Opened in start() since file handles can't be pickled across spawn.
+        self._audit_log_path = config.envs.audit_log_path
+        self.audit: Optional[AuditLog] = None
 
     def _spawn_display(self):
         """Start the DisplayProcess if it isn't already running."""
@@ -292,6 +298,9 @@ class MonitorHandler(BaseHandler):
     def start(self):
         """Lifecycle hook fired when ResultProcess starts up."""
         super().start()
+        self.audit = AuditLog(self._audit_log_path, name=self.name)
+        if self.audit:
+            self.audit.log("handler.start", handler=self.name, initial_enabled=self._enabled)
         self._started = True
         if self._enabled:
             self._spawn_display()
@@ -303,6 +312,9 @@ class MonitorHandler(BaseHandler):
         self._enabled = True
         if self._started:
             self._spawn_display()
+        if self.audit:
+            self.audit.log("monitor.enable")
+        logger.info(f"[{self.name}] Monitor turned ON.")
         return True
 
     def disable(self) -> bool:
@@ -311,7 +323,14 @@ class MonitorHandler(BaseHandler):
             return False
         self._enabled = False
         self._terminate_display()
+        if self.audit:
+            self.audit.log("monitor.disable")
+        logger.info(f"[{self.name}] Monitor turned OFF.")
         return False
+
+    def toggle(self) -> bool:
+        """One-shot GUI callback: flip on/off. Returns the new enabled state."""
+        return self.disable() if self._enabled else self.enable()
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -337,3 +356,6 @@ class MonitorHandler(BaseHandler):
 
     def stop(self):
         self._terminate_display()
+        if self.audit:
+            self.audit.log("handler.stop", handler=self.name)
+            self.audit.close()

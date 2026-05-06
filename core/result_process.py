@@ -132,26 +132,6 @@ class ResultProcess(mp.Process):
                 return h
         return None
 
-    def _handle_toggle_monitor(self) -> bool:
-        """GUI callback: flip the MonitorHandler on/off. Returns the new state."""
-        mh = self._find_monitor_handler()
-        if mh is None:
-            return False
-        if mh.is_enabled():
-            new_state = mh.disable()
-            event = "monitor.disable"
-        else:
-            new_state = mh.enable()
-            event = "monitor.enable"
-        logger.info(f"[{self.name}] Monitor toggled -> {'ON' if new_state else 'OFF'}.")
-        if self.audit:
-            self.audit.log(event)
-        return bool(new_state)
-
-    def _get_monitor_enabled(self) -> bool:
-        mh = self._find_monitor_handler()
-        return bool(mh.is_enabled()) if mh is not None else False
-
     def _get_active_devices_snapshot(self) -> dict[str, set[str]]:
         """Aggregate active-device sets across handlers for GUI status display."""
         snapshot: dict[str, set[str]] = {}
@@ -276,12 +256,12 @@ class ResultProcess(mp.Process):
         try:
             from .gui import InteractionGUI, ManualTriggerGUI
 
-            interaction_gui = InteractionGUI(
-                self.config,
-                on_cancel_all_callback=self._handle_cancel_all,
-                on_toggle_monitor_callback=self._handle_toggle_monitor,
-                monitor_status_provider=self._get_monitor_enabled,
-                status_provider=self._get_active_devices_snapshot,
+            # Component assembly lives in InteractionGUI.operator_panel — adding a
+            # new control to the panel happens in gui.py, not here.
+            interaction_gui = InteractionGUI.operator_panel(
+                on_cancel_all=self._handle_cancel_all,
+                monitor_handler=self._find_monitor_handler(),
+                active_devices_provider=self._get_active_devices_snapshot,
             )
             interaction_gui.setup()
 

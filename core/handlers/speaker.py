@@ -62,22 +62,38 @@ class SpeakerHandler(BaseHandler):
 
         self.stream_to_speakers: dict[int, set[str]] = {sid: zone.speakers for sid, zone in config.sid_to_zone.items()}
 
-        all_unique_ips = {ip for ips in self.stream_to_speakers.values() for ip in ips}
-        self.device_states: dict[str, str] = dict.fromkeys(all_unique_ips, "READY")
+        self._all_unique_ips: list[str] = sorted({ip for ips in self.stream_to_speakers.values() for ip in ips})
+        self.device_states: dict[str, str] = dict.fromkeys(self._all_unique_ips, "READY")
 
-        self._state_lock = threading.Lock()
-        self.cancel_events: dict[str, threading.Event] = {ip: threading.Event() for ip in all_unique_ips}
+        # Threading primitives MUST NOT exist before pickling — _thread.lock and
+        # threading.Event aren't picklable, which breaks spawn-based mp on Windows.
+        # The properties below lazy-create them on first access in the child process.
+        self._state_lock: Optional[threading.Lock] = None
+        self._cancel_events: Optional[dict[str, threading.Event]] = None
 
         self._executor = None
-        logger.info(f"[{self.name}] Async Handler initialized for {len(all_unique_ips)} devices.")
+        logger.info(f"[{self.name}] Async Handler initialized for {len(self._all_unique_ips)} devices.")
+
+    @property
+    def state_lock(self) -> threading.Lock:
+        """Lazy-init lock on first access (post-spawn)."""
+        if self._state_lock is None:
+            self._state_lock = threading.Lock()
+        return self._state_lock
+
+    @property
+    def cancel_events(self) -> dict[str, threading.Event]:
+        """Lazy-init per-device cancel events on first access (post-spawn)."""
+        if self._cancel_events is None:
+            self._cancel_events = {ip: threading.Event() for ip in self._all_unique_ips}
+        return self._cancel_events
 
     @property
     def executor(self):
         """Initialize the thread pool only after the process starts."""
         if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=max(1, len(self.device_states)), thread_name_prefix=self.name
-            )
+            num_threads = max(1, len(self.device_states))
+            self._executor = ThreadPoolExecutor(max_workers=num_threads, thread_name_prefix=self.name)
         return self._executor
 
     def start(self):
@@ -93,7 +109,7 @@ class SpeakerHandler(BaseHandler):
 
         target_ips = self.stream_to_speakers.get(result.stream_id, [])
         for ip in target_ips:
-            with self._state_lock:
+            with self.state_lock:
                 if self.device_states.get(ip) != "READY":
                     continue
                 self.device_states[ip] = "ACTIVE"
@@ -117,7 +133,7 @@ class SpeakerHandler(BaseHandler):
             error_msg = str(e)
             logger.error(f"[{self.name}] Async lifecycle error on {ip}: {e}")
         finally:
-            with self._state_lock:
+            with self.state_lock:
                 self.device_states[ip] = "READY"
                 self.cancel_events[ip].clear()
             if self.audit:
@@ -171,7 +187,7 @@ class SpeakerHandler(BaseHandler):
         """Signal every active speaker to abort and stop broadcasting."""
         if not self.enable:
             return
-        with self._state_lock:
+        with self.state_lock:
             active_ips = [ip for ip, st in self.device_states.items() if st == "ACTIVE"]
             for ip in active_ips:
                 self.cancel_events[ip].set()
@@ -183,7 +199,7 @@ class SpeakerHandler(BaseHandler):
     def get_active_devices(self) -> set[str]:
         if not self.enable:
             return set()
-        with self._state_lock:
+        with self.state_lock:
             return {ip for ip, st in self.device_states.items() if st == "ACTIVE"}
 
     def stop(self):

@@ -1,10 +1,19 @@
 import logging
 import time
 import tkinter as tk
+from abc import ABC, abstractmethod
 from tkinter import messagebox
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 from .config import Config
+
+
+class _MonitorTogglable(Protocol):
+    """Duck-typed contract the operator-panel factory needs from a monitor handler."""
+
+    def toggle(self) -> bool: ...
+
+    def is_enabled(self) -> bool: ...
 
 
 logger = logging.getLogger(__name__)
@@ -24,77 +33,52 @@ _DOT_HIJACK = "#f39c12"
 _DOT_ACTIVE = "#e74c3c"
 
 
-class InteractionGUI:
+# ----------------------------------------------------------------------------
+# Component framework
+# ----------------------------------------------------------------------------
+
+# Type alias: callable used to push a message into the host GUI's status bar.
+StatusSetter = Callable[..., None]
+
+
+class GuiComponent(ABC):
     """
-    User-facing control panel.
+    A self-contained widget that mounts itself into a parent Tk frame and
+    optionally refreshes on a periodic tick.
 
-    Two operator actions:
-      1. CANCEL ALL ALERTS  - turns off active devices and clears hijacks/hold-down.
-      2. MONITOR ON/OFF     - toggles the visualization DisplayProcess at runtime.
-
-    Designed to stay visible during normal operation; lightweight (no per-stream grid).
+    Each component owns its own state, click handler, and visual refresh,
+    so adding a new control = a new class + appending it to the GUI's
+    component list. The host GUI knows nothing about the control type.
     """
 
-    def __init__(
-        self,
-        config: Config,
-        on_cancel_all_callback: Callable[[], None],
-        on_toggle_monitor_callback: Callable[[], bool],
-        monitor_status_provider: Callable[[], bool],
-        status_provider: Optional[Callable[[], dict]] = None,
-        name: str = "InteractionGUI",
-    ):
-        self.name = name
-        self.config = config
-        self.on_cancel_all_callback = on_cancel_all_callback
-        self.on_toggle_monitor_callback = on_toggle_monitor_callback
-        self.monitor_status_provider = monitor_status_provider
-        self.status_provider = status_provider
+    @abstractmethod
+    def mount(self, parent: tk.Misc, set_status: Optional[StatusSetter] = None) -> None:
+        """Build and pack this component into `parent`."""
 
-        self.root: Optional[tk.Tk] = None
-        self.monitor_btn: Optional[tk.Button] = None
-        self.activity_label: Optional[tk.Label] = None
-        self.status_label: Optional[tk.Label] = None
+    def refresh(self) -> None:
+        """Optional periodic hook (called from the host GUI's update loop)."""
+        return None
 
-        self._last_refresh = 0.0
-        self._refresh_interval = 0.25  # 4 Hz
 
-    def setup(self):
-        try:
-            self.root = tk.Tk()
-        except tk.TclError as e:
-            logger.error(f"[{self.name}] Tkinter unavailable: {e}")
-            self.root = None
-            return
+# ----------------------------------------------------------------------------
+# Concrete components
+# ----------------------------------------------------------------------------
 
-        self.root.title("Bird Count - Operator Control")
-        self.root.attributes("-topmost", True)
-        self.root.resizable(False, False)
-        self.root.configure(bg=_BG_PAGE)
 
-        # Place top-right of screen so it doesn't collide with the manual hijack panel.
-        try:
-            sw = self.root.winfo_screenwidth()
-            self.root.geometry(f"360x260+{max(0, sw - 380)}+20")
-        except tk.TclError:
-            pass
+class CancelAllButton(GuiComponent):
+    """Red button with confirmation dialog. Fires `on_cancel_all` on confirm."""
 
-        # 1. Header
-        header = tk.Frame(self.root, bg=_BG_HEADER)
-        header.pack(pady=10, fill="x")
-        tk.Label(
-            header,
-            text="OPERATOR CONTROL",
-            fg="white",
-            bg=_BG_HEADER,
-            font=("Segoe UI", 12, "bold"),
-        ).pack()
+    def __init__(self, on_cancel_all: Callable[[], None]):
+        self.on_cancel_all = on_cancel_all
+        self.btn: Optional[tk.Button] = None
+        self.set_status: Optional[StatusSetter] = None
 
-        # 2. Cancel All
-        cancel_frame = tk.Frame(self.root, bg=_BG_PAGE)
-        cancel_frame.pack(padx=12, pady=(12, 6), fill="x")  # tuple 在这里才有效
-        cancel_btn = tk.Button(
-            cancel_frame,
+    def mount(self, parent: tk.Misc, set_status: Optional[StatusSetter] = None) -> None:
+        self.set_status = set_status
+        frame = tk.Frame(parent, bg=_BG_PAGE)
+        frame.pack(padx=12, pady=(12, 6), fill="x")
+        self.btn = tk.Button(
+            frame,
             text="CANCEL ALL ALERTS",
             bg=_BG_CANCEL,
             fg="white",
@@ -103,38 +87,195 @@ class InteractionGUI:
             relief="flat",
             font=("Segoe UI", 11, "bold"),
             height=2,
-            command=self._handle_cancel_all_click,
+            command=self._on_click,
         )
-        cancel_btn.pack(fill="x")
-        cancel_btn.bind("<Enter>", lambda e: cancel_btn.config(bg=_BG_CANCEL_HOVER))
-        cancel_btn.bind("<Leave>", lambda e: cancel_btn.config(bg=_BG_CANCEL))
+        self.btn.pack(fill="x")
+        self.btn.bind("<Enter>", lambda e: self.btn.config(bg=_BG_CANCEL_HOVER))
+        self.btn.bind("<Leave>", lambda e: self.btn.config(bg=_BG_CANCEL))
 
-        # 3. Monitor Toggle
-        monitor_frame = tk.Frame(self.root, bg=_BG_PAGE)
-        monitor_frame.pack(padx=12, pady=6, fill="x")
-        self.monitor_btn = tk.Button(
-            monitor_frame,
+    def _on_click(self) -> None:
+        if not self.btn:
+            return
+        confirmed = messagebox.askyesno(
+            title="Confirm Cancel All",
+            message="Cancel all active alerts and clear all manual hijacks?\n\n"
+            "This will turn off every active speaker/plug and reset hold-down timers.",
+            parent=self.btn.winfo_toplevel(),
+        )
+        if not confirmed:
+            return
+        try:
+            self.on_cancel_all()
+        except Exception as e:
+            logger.error(f"[CancelAllButton] callback failed: {e}")
+        if self.set_status:
+            self.set_status(f"All alerts cancelled at {time.strftime('%H:%M:%S')}", fg="#c0392b")
+
+
+class MonitorToggleButton(GuiComponent):
+    """
+    Bicolor ON/OFF button driven by a state provider. Calls `on_toggle()`
+    (which itself returns the new state) and re-syncs visually each tick so
+    external state changes reflect even when the user didn't click.
+    """
+
+    def __init__(self, on_toggle: Callable[[], bool], status_provider: Callable[[], bool]):
+        self.on_toggle = on_toggle
+        self.status_provider = status_provider
+        self.btn: Optional[tk.Button] = None
+        self.set_status: Optional[StatusSetter] = None
+
+    def mount(self, parent: tk.Misc, set_status: Optional[StatusSetter] = None) -> None:
+        self.set_status = set_status
+        frame = tk.Frame(parent, bg=_BG_PAGE)
+        frame.pack(padx=12, pady=6, fill="x")
+        self.btn = tk.Button(
+            frame,
             text="MONITOR: ...",
             fg="white",
             relief="flat",
             font=("Segoe UI", 11, "bold"),
             height=2,
-            command=self._handle_toggle_monitor_click,
+            command=self._on_click,
         )
-        self.monitor_btn.pack(fill="x")
-        self._refresh_monitor_button()
+        self.btn.pack(fill="x")
+        self._apply_appearance()
 
-        # 4. Activity summary + status bar
-        self.activity_label = tk.Label(
-            self.root,
+    def _on_click(self) -> None:
+        try:
+            new_state = bool(self.on_toggle())
+        except Exception as e:
+            logger.error(f"[MonitorToggleButton] toggle failed: {e}")
+            return
+        self._apply_appearance(new_state)
+        if self.set_status:
+            label = "ON" if new_state else "OFF"
+            self.set_status(
+                f"Monitor turned {label} at {time.strftime('%H:%M:%S')}",
+                fg="#27ae60" if new_state else "#7f8c8d",
+            )
+
+    def _apply_appearance(self, state: Optional[bool] = None) -> None:
+        if not self.btn:
+            return
+        if state is None:
+            try:
+                state = bool(self.status_provider())
+            except Exception:
+                state = False
+        if state:
+            self.btn.config(
+                text="MONITOR: ON  (click to turn OFF)",
+                bg=_BG_MONITOR_ON,
+                activebackground=_BG_MONITOR_ON_HOVER,
+            )
+        else:
+            self.btn.config(
+                text="MONITOR: OFF  (click to turn ON)",
+                bg=_BG_MONITOR_OFF,
+                activebackground=_BG_MONITOR_OFF_HOVER,
+            )
+
+    def refresh(self) -> None:
+        self._apply_appearance()
+
+
+class ActivityLabel(GuiComponent):
+    """Read-only label showing total + per-handler active device counts."""
+
+    def __init__(self, status_provider: Callable[[], dict]):
+        self.status_provider = status_provider
+        self.label: Optional[tk.Label] = None
+
+    def mount(self, parent: tk.Misc, set_status: Optional[StatusSetter] = None) -> None:
+        self.label = tk.Label(
+            parent,
             text="Active devices: 0",
             bg=_BG_PAGE,
             fg="#2c3e50",
             font=("Segoe UI", 9),
             pady=4,
         )
-        self.activity_label.pack(fill="x")
+        self.label.pack(fill="x")
 
+    def refresh(self) -> None:
+        if not self.label:
+            return
+        try:
+            snapshot = self.status_provider() or {}
+        except Exception:
+            return
+        total = sum(len(v) for v in snapshot.values() if v)
+        parts = [f"{k}={len(v)}" for k, v in snapshot.items() if v]
+        suffix = f"  ({', '.join(parts)})" if parts else ""
+        try:
+            self.label.config(text=f"Active devices: {total}{suffix}")
+        except tk.TclError:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Host GUIs
+# ----------------------------------------------------------------------------
+
+
+class InteractionGUI:
+    """
+    Thin operator-facing shell. Owns the Tk root, header, and status bar; the
+    body is a vertical stack of GuiComponents passed in by the caller. Adding a
+    new control = define a new GuiComponent and append it to the components list.
+    """
+
+    def __init__(
+        self,
+        components: list[GuiComponent],
+        title: str = "Bird Count - Operator Control",
+        header_text: str = "OPERATOR CONTROL",
+        name: str = "InteractionGUI",
+    ):
+        self.components = components
+        self.title = title
+        self.header_text = header_text
+        self.name = name
+
+        self.root: Optional[tk.Tk] = None
+        self.status_label: Optional[tk.Label] = None
+
+        self._last_refresh = 0.0
+        self._refresh_interval = 0.25  # 4 Hz
+
+    def setup(self) -> None:
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as e:
+            logger.error(f"[{self.name}] Tkinter unavailable: {e}")
+            self.root = None
+            return
+
+        self.root.title(self.title)
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+        self.root.configure(bg=_BG_PAGE)
+
+        # Place top-right of screen so it doesn't collide with the manual hijack panel.
+        try:
+            sw = self.root.winfo_screenwidth()
+            self.root.geometry(f"360x320+{max(0, sw - 380)}+20")
+        except tk.TclError:
+            pass
+
+        # Header
+        header = tk.Frame(self.root, bg=_BG_HEADER)
+        header.pack(pady=10, fill="x")
+        tk.Label(
+            header,
+            text=self.header_text,
+            fg="white",
+            bg=_BG_HEADER,
+            font=("Segoe UI", 12, "bold"),
+        ).pack()
+
+        # Status bar (created early so set_status works during component mount).
         self.status_label = tk.Label(
             self.root,
             text="Ready...",
@@ -147,89 +288,45 @@ class InteractionGUI:
         )
         self.status_label.pack(fill="x", side="bottom")
 
-    def _handle_cancel_all_click(self):
-        if not self.root:
-            return
-        confirmed = messagebox.askyesno(
-            title="Confirm Cancel All",
-            message="Cancel all active alerts and clear all manual hijacks?\n\n"
-            "This will turn off every active speaker/plug and reset hold-down timers.",
-            parent=self.root,
-        )
-        if not confirmed:
-            return
-        try:
-            self.on_cancel_all_callback()
-        except Exception as e:
-            logger.error(f"[{self.name}] cancel_all callback failed: {e}")
+        # Body — components stack vertically, each one self-mounts.
+        body = tk.Frame(self.root, bg=_BG_PAGE)
+        body.pack(fill="both", expand=True)
 
-        if self.status_label:
-            self.status_label.config(
-                text=f"All alerts cancelled at {time.strftime('%H:%M:%S')}",
-                fg="#c0392b",
-            )
-
-    def _handle_toggle_monitor_click(self):
-        try:
-            new_state = self.on_toggle_monitor_callback()
-        except Exception as e:
-            logger.error(f"[{self.name}] toggle_monitor callback failed: {e}")
-            return
-        self._refresh_monitor_button(new_state)
-        if self.status_label:
-            label = "ON" if new_state else "OFF"
-            self.status_label.config(
-                text=f"Monitor turned {label} at {time.strftime('%H:%M:%S')}",
-                fg="#27ae60" if new_state else "#7f8c8d",
-            )
-
-    def _refresh_monitor_button(self, state: Optional[bool] = None):
-        if not self.monitor_btn:
-            return
-        if state is None:
+        for comp in self.components:
             try:
-                state = bool(self.monitor_status_provider())
-            except Exception:
-                state = False
-        if state:
-            self.monitor_btn.config(
-                text="MONITOR: ON  (click to turn OFF)",
-                bg=_BG_MONITOR_ON,
-                activebackground=_BG_MONITOR_ON_HOVER,
-            )
-        else:
-            self.monitor_btn.config(
-                text="MONITOR: OFF  (click to turn ON)",
-                bg=_BG_MONITOR_OFF,
-                activebackground=_BG_MONITOR_OFF_HOVER,
-            )
+                comp.mount(body, set_status=self.set_status)
+            except Exception as e:
+                logger.error(f"[{self.name}] {type(comp).__name__} mount failed: {e}")
 
-    def _refresh_activity(self):
-        if not self.activity_label or not self.status_provider:
+    def set_status(self, text: str, fg: Optional[str] = None) -> None:
+        """Pushed down into components so each one can update the shared status bar."""
+        if not self.status_label:
             return
         try:
-            snapshot = self.status_provider() or {}
-        except Exception:
-            return
-        total = sum(len(v) for v in snapshot.values() if v)
-        parts = [f"{k}={len(v)}" for k, v in snapshot.items() if v]
-        suffix = f"  ({', '.join(parts)})" if parts else ""
-        self.activity_label.config(text=f"Active devices: {total}{suffix}")
+            kwargs: dict = {"text": text}
+            if fg is not None:
+                kwargs["fg"] = fg
+            self.status_label.config(**kwargs)
+        except tk.TclError:
+            pass
 
-    def update(self):
+    def update(self) -> None:
         if not self.root:
             return
         try:
             now = time.time()
             if now - self._last_refresh >= self._refresh_interval:
-                self._refresh_monitor_button()
-                self._refresh_activity()
+                for comp in self.components:
+                    try:
+                        comp.refresh()
+                    except Exception as e:
+                        logger.debug(f"[{self.name}] {type(comp).__name__} refresh error: {e}")
                 self._last_refresh = now
             self.root.update()
         except tk.TclError:
             self.root = None
 
-    def destroy(self):
+    def destroy(self) -> None:
         if self.root:
             try:
                 logger.info(f"[{self.name}] Destroying interaction GUI...")
@@ -237,6 +334,34 @@ class InteractionGUI:
                 self.root = None
             except Exception as e:
                 logger.error(f"[{self.name}] Error during destroy: {e}")
+
+    # ------------------------------------------------------------------
+    # Factories
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def operator_panel(
+        cls,
+        *,
+        on_cancel_all: Callable[[], None],
+        monitor_handler: Optional[_MonitorTogglable] = None,
+        active_devices_provider: Optional[Callable[[], dict]] = None,
+    ) -> "InteractionGUI":
+        """
+        Assemble the standard operator panel: Cancel All + (optional) Monitor toggle
+        + (optional) active-devices summary. Caller only imports InteractionGUI.
+        """
+        components: list[GuiComponent] = [CancelAllButton(on_cancel_all=on_cancel_all)]
+        if monitor_handler is not None:
+            components.append(
+                MonitorToggleButton(
+                    on_toggle=monitor_handler.toggle,
+                    status_provider=monitor_handler.is_enabled,
+                )
+            )
+        if active_devices_provider is not None:
+            components.append(ActivityLabel(status_provider=active_devices_provider))
+        return cls(components)
 
 
 class ManualTriggerGUI:
