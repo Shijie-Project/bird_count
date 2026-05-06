@@ -93,13 +93,13 @@ class Bird(data.Dataset):
         density = gen_discrete_map(h, w, keypoints)
         density = downsample_count_map(density, self.d_ratio)
 
-        if self.is_train:
-            return (
-                img,
-                torch.from_numpy(np.ascontiguousarray(keypoints)).float(),
-                torch.from_numpy(density).float().unsqueeze(0),
-            )
-        return img_path, img, torch.from_numpy(density).float(), name
+        return {
+            "path": img_path,
+            "name": name,
+            "image": img,  # (3, H, W)
+            "keypoints": torch.from_numpy(np.ascontiguousarray(keypoints)).float(),  # (N, 2)
+            "density": torch.from_numpy(density).float().unsqueeze(0),  # (1, H/d, W/d)
+        }
 
     @staticmethod
     def _load_keypoints(path, img_size):
