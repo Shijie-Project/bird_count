@@ -10,6 +10,11 @@ from . import transforms as T
 from .targets import downsample_count_map, gen_discrete_map
 
 
+# Project-wide output stride for the density model. Trainer, Bird, and
+# DMCountLoss must all use the same value, so it lives in one place.
+DOWNSAMPLE_RATIO = 8
+
+
 def build_train_transform(
     crop_size,
     scale_range=(0.8, 1.25),
@@ -37,22 +42,27 @@ def build_train_transform(
     )
 
 
-def build_val_transform():
-    return T.Compose([T.ToTensor(), T.Normalize()])
+def build_val_transform(downsample_ratio: int = DOWNSAMPLE_RATIO):
+    """Val transform: ToTensor → Normalize → pad to multiple of `downsample_ratio`.
+
+    Padding is necessary because val images are at native resolution and may
+    not be divisible by the model's output stride; without it
+    `downsample_count_map` would raise on the next line.
+    """
+    return T.Compose([T.ToTensor(), T.Normalize(), T.PadToMultiple(downsample_ratio)])
 
 
 class Bird(data.Dataset):
-    """Counting dataset returning (image, keypoints, density) tuples.
+    """Counting dataset returning a per-sample dict.
 
-    Train sample: (image[3, c, c], keypoints[N, 2], gt[1, c/d, c/d])
-    Val sample:   (img_path, image[3, h, w], gt[h/d, w/d], name)
+    keys: path (str), name (str), image (3,H,W), keypoints (N,2), density (1,H/d,W/d)
     """
 
     def __init__(
         self,
         root_path,
         crop_size,
-        downsample_ratio=8,
+        downsample_ratio=DOWNSAMPLE_RATIO,
         split="train",
         transform=None,
         train_aug=None,
@@ -68,7 +78,9 @@ class Bird(data.Dataset):
 
         if transform is None:
             transform = (
-                build_train_transform(crop_size, **(train_aug or {})) if self.is_train else build_val_transform()
+                build_train_transform(crop_size, **(train_aug or {}))
+                if self.is_train
+                else build_val_transform(downsample_ratio)
             )
         self.transform = transform
 

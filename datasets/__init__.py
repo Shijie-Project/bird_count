@@ -3,10 +3,17 @@ import random
 import numpy as np
 import torch
 
-from .bird import Bird, build_train_transform, build_val_transform
+from .bird import DOWNSAMPLE_RATIO, Bird, build_train_transform, build_val_transform
 
 
-__all__ = ["Bird", "build_train_transform", "build_val_transform", "collate", "seed_worker"]
+__all__ = [
+    "Bird",
+    "DOWNSAMPLE_RATIO",
+    "build_train_transform",
+    "build_val_transform",
+    "collate",
+    "seed_worker",
+]
 
 
 _STACK_KEYS = ("image", "density")

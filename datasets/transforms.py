@@ -174,3 +174,24 @@ class RandomGaussianNoise:
         if self.std > 0 and random.random() < self.p:
             img = img + torch.randn_like(img) * self.std
         return img, keypoints
+
+
+class PadToMultiple:
+    """Right/bottom-pad a (C, H, W) tensor so H and W are multiples of `m`.
+
+    Padding is added with value 0 (≈ neutral gray after ImageNet normalization),
+    so the model sees an unobtrusive border. Keypoints are unchanged because
+    padding is appended after the original content.
+    """
+
+    def __init__(self, multiple: int):
+        self.m = multiple
+
+    def __call__(self, img, keypoints):
+        h, w = img.shape[-2:]
+        pad_w = (self.m - w % self.m) % self.m
+        pad_h = (self.m - h % self.m) % self.m
+        if pad_h or pad_w:
+            # torch.nn.functional.pad: (left, right, top, bottom)
+            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h))
+        return img, keypoints
