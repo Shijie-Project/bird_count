@@ -150,7 +150,7 @@ def get_shufflenet_density_model(
     model = ShuffleNetDensityNet(freeze_backbone_bn=freeze_backbone_bn)
 
     if model_path and os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location="cpu")
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
         sd = extract_state_dict(checkpoint)
         sd, migrated, dropped = _migrate_legacy_state_dict(sd)
         missing, unexpected = model.load_state_dict(sd, strict=not migrated)
