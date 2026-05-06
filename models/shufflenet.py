@@ -1,5 +1,18 @@
+"""ShuffleNetV2-backed density estimator with U-Net-style lateral skip.
+
+Backbone: torchvision ShuffleNetV2-1.0x truncated at stage3. The regression
+head fuses stage2 features (1/8) with upsampled stage3 features (1/16 -> 1/8)
+before predicting the density map at **input/8** resolution, matching the
+dataset's `downsample_ratio=8`.
+
+The skip connection feeds high-resolution stage2 features directly into the
+head so it can localize small chickens precisely, while still benefiting from
+the deeper semantic features of stage3.
+"""
+
 import logging
 import os
+from collections import OrderedDict
 from typing import Optional
 
 import torch
@@ -7,203 +20,158 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import ShuffleNet_V2_X1_0_Weights, shufflenet_v2_x1_0
 
+from .utils import count_conv_bn_pairs, extract_state_dict, fuse_conv_bn_recursive
 
-# Setup Module Logger
+
 logger = logging.getLogger(__name__)
 
 
-class ShuffleNetDensityNet(nn.Module):
-    """
-    Density Estimation Network using ShuffleNetV2 as backbone.
-    Optimized for Inference on GTX 1080Ti.
-    """
+class _BackboneFeatures(nn.Module):
+    """ShuffleNetV2 stem + stage2 + stage3, exposing both stage outputs."""
 
-    def __init__(self, backbone_features: nn.Module):
+    def __init__(self):
         super().__init__()
-        self.features = backbone_features
+        bb = shufflenet_v2_x1_0(weights=ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1)
+        self.conv1 = bb.conv1
+        self.maxpool = bb.maxpool
+        self.stage2 = bb.stage2
+        self.stage3 = bb.stage3
 
-        # Automatically infer the number of output channels from backbone
-        in_channels = self._get_backbone_out_channels()
+    def forward(self, x):
+        x = self.maxpool(self.conv1(x))  # 1/4
+        f2 = self.stage2(x)  # 1/8
+        f3 = self.stage3(f2)  # 1/16
+        return f2, f3
 
-        # Density Regression Head
+
+class ShuffleNetDensityNet(nn.Module):
+    """U-Net-style density head: concat(stage2, upsample(stage3)) -> head -> density.
+
+    forward(x: [B, 3, H, W]) -> density: [B, 1, H/8, W/8]
+    """
+
+    def __init__(self, freeze_backbone_bn: bool = True):
+        super().__init__()
+        self.backbone = _BackboneFeatures()
+        self.freeze_backbone_bn = freeze_backbone_bn
+
+        c2, c3 = self._infer_stage_channels()
+        head_in = c2 + c3  # 116 + 232 = 348
+
         self.reg_layer = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
+            nn.Conv2d(head_in, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        # Final 1x1 conv to produce a single-channel density map
         self.density_layer = nn.Sequential(
             nn.Conv2d(128, 1, kernel_size=1),
-            nn.ReLU(inplace=True),  # Ensure non-negative density
+            nn.ReLU(inplace=True),  # density must be non-negative
         )
 
     @torch.no_grad()
-    def _get_backbone_out_channels(self) -> int:
-        """Helper to determine the feature map depth."""
+    def _infer_stage_channels(self):
+        was_training = self.training
         self.eval()
-        dummy_input = torch.zeros(1, 3, 224, 224)
-        output = self.features(dummy_input)
-        return output.shape[1]
+        try:
+            f2, f3 = self.backbone(torch.zeros(1, 3, 64, 64))
+            return f2.shape[1], f3.shape[1]
+        finally:
+            self.train(was_training)
 
-    def train(self, mode=True):
-        """Override train mode to keep BatchNorm in eval mode if needed for stability."""
+    def train(self, mode: bool = True):
         super().train(mode)
-        # Example: Keeping backbone BN fixed if fine-tuning
-        for m in self.features.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
+        if mode and self.freeze_backbone_bn:
+            for m in self.backbone.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        Returns:
-            density_map (Tensor): [B, 1, H/4, W/4] The pixel-wise density.
-        """
-        # 1. Feature extraction (downsample 32x usually)
-        x = self.features(x)
-
-        # 2. Upsampling (Recover spatial resolution)
-        # Bilinear is fast on 1080Ti
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-
-        # 3. Density estimation
-        x = self.reg_layer(x)
-        density_map = self.density_layer(x)
-
-        return density_map
+        f2, f3 = self.backbone(x)
+        f3_up = F.interpolate(f3, scale_factor=2, mode="bilinear", align_corners=False)
+        fused = torch.cat([f2, f3_up], dim=1)
+        x = self.reg_layer(fused)
+        return self.density_layer(x)
 
     def fuse_model(self):
-        """
-        Industrial Optimization: Fuses Conv2d + BatchNorm2d layers.
-        This reduces memory access overhead during inference.
-        """
-        from torch.nn.utils.fusion import fuse_conv_bn_eval
-
-        logger.info("Fusing Conv+BN layers for faster inference...")
-
-        # Fuse inside the regression head
-        # We know the structure is Conv -> BN -> ReLU -> Conv -> BN -> ReLU
-        # Note: Fusing usually requires the module to be in eval mode
+        """Fuse every Conv2d+BatchNorm2d pair in the model (backbone + head)."""
         self.eval()
+        n_before = count_conv_bn_pairs(self)
+        fuse_conv_bn_recursive(self)
+        n_after = count_conv_bn_pairs(self)
+        logger.info(f"Fused {n_before - n_after} Conv+BN pairs ({n_before} -> {n_after}).")
 
-        try:
-            # Fuse first block
-            fused_0 = fuse_conv_bn_eval(self.reg_layer[0], self.reg_layer[1])
-            # Fuse second block
-            fused_1 = fuse_conv_bn_eval(self.reg_layer[3], self.reg_layer[4])
 
-            # Rebuild the sequential model with fused layers
-            # Note: We remove the BN layers (indices 1 and 4)
-            self.reg_layer = nn.Sequential(
-                fused_0,
-                self.reg_layer[2],  # ReLU
-                fused_1,
-                self.reg_layer[5],  # ReLU
-            )
+_LEGACY_BACKBONE_MAP = {
+    "features.0.": "backbone.conv1.",
+    "features.2.": "backbone.stage2.",
+    "features.3.": "backbone.stage3.",
+    # features.1 was maxpool (no parameters)
+}
 
-            logger.info("Model fusion complete.")
-        except Exception as e:
-            logger.warning(f"Model fusion failed (safe to skip): {e}")
+
+def _migrate_legacy_state_dict(state_dict):
+    """Remap pre-skip-connection checkpoints to the current module layout.
+
+    Old layout: a single `features` Sequential containing [conv1, maxpool,
+    stage2, stage3]. Current layout: a `backbone` submodule with named
+    children. The regression-head input-channel count changed (232 -> 348),
+    so old `reg_layer.0.*` and `density_layer.*` weights are dropped — they
+    need to be re-trained.
+    """
+    if not any(k.startswith("features.") for k in state_dict):
+        return state_dict, False, []
+
+    new_sd = OrderedDict()
+    dropped = []
+    for k, v in state_dict.items():
+        new_k = k
+        for old_prefix, new_prefix in _LEGACY_BACKBONE_MAP.items():
+            if k.startswith(old_prefix):
+                new_k = new_prefix + k[len(old_prefix) :]
+                break
+        if k.startswith(("reg_layer.0.", "density_layer.")):
+            dropped.append(k)
+            continue
+        new_sd[new_k] = v
+    return new_sd, True, dropped
 
 
 def get_shufflenet_density_model(
-    model_path: Optional[str] = None, device: str | torch.device = "cpu", fuse: bool = False
+    model_path: Optional[str] = None,
+    device: "str | torch.device" = "cpu",
+    fuse: bool = False,
+    freeze_backbone_bn: bool = True,
 ) -> nn.Module:
-    """
-    Factory function to create, load, and optimize the ShuffleNetDensityNet.
-    """
-    logger.info("Initializing ShuffleNet Density Model...")
+    """Build ShuffleNetDensityNet, optionally load weights, optionally fuse."""
+    model = ShuffleNetDensityNet(freeze_backbone_bn=freeze_backbone_bn)
 
-    # 1. Load Backbone
-    # Using 'weights' instead of 'pretrained'
-    backbone = shufflenet_v2_x1_0(weights=ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1)
-
-    # 2. Extract feature layers (remove classifier)
-    # ShuffleNetV2: children() are [stage1, ..., conv5, fc]
-    # We take everything except the last few layers to get spatial features
-    # Check architecture: usually we want up to 'conv5'
-    features = nn.Sequential(*list(backbone.children())[:-3])
-
-    # 3. Initialize Density Network
-    model = ShuffleNetDensityNet(features)
-
-    # 4. Load Weights
     if model_path and os.path.exists(model_path):
-        try:
-            checkpoint = torch.load(model_path, map_location="cpu")
-            state_dict = checkpoint.get("state_dict", checkpoint)
-
-            # Handle DataParallel prefix 'module.'
-            if any(k.startswith("module.") for k in state_dict.keys()):
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-
-            model.load_state_dict(state_dict, strict=True)
-            logger.info(f"Loaded weights from {model_path}")
-        except Exception as e:
-            logger.error(f"Failed to load weights: {e}")
-            # Depending on policy, we might want to raise here
-            raise
+        checkpoint = torch.load(model_path, map_location="cpu")
+        sd = extract_state_dict(checkpoint)
+        sd, migrated, dropped = _migrate_legacy_state_dict(sd)
+        missing, unexpected = model.load_state_dict(sd, strict=not migrated)
+        if migrated:
+            logger.warning(
+                "Loaded legacy checkpoint: backbone remapped to new layout; "
+                f"dropped {len(dropped)} old head keys (head will re-init from scratch). "
+                "Re-train or fine-tune the regression head before deploying."
+            )
+        if missing:
+            logger.warning(f"Missing keys (random-init): {len(missing)} entries, e.g. {missing[:3]}")
+        if unexpected:
+            logger.warning(f"Unexpected keys (ignored): {len(unexpected)} entries, e.g. {unexpected[:3]}")
+        logger.info(f"Loaded weights from {model_path}")
+    elif model_path:
+        logger.warning(f"Checkpoint not found at {model_path}; using random init.")
     else:
-        if model_path:
-            logger.warning(f"Checkpoint file not found at {model_path}. Using random init.")
-        else:
-            logger.info("No model path provided. Using random init (Dev Mode).")
+        logger.info("No model path provided; using random init (dev mode).")
 
-    # 5. Optimization
     model.eval()
     model.to(device)
-
     if fuse:
         model.fuse_model()
-
     return model
-
-
-def export_to_onnx(model_path, onnx_output_path, device="cuda"):
-    # 1. Initialize and load the model
-    # We set fuse=True to simplify the graph before exporting
-    model = get_shufflenet_density_model(model_path=model_path, device=device, fuse=True)
-    model.eval()
-
-    # 2. Define dummy input
-    # Standard size is usually 224x224, but ensure it matches your inference size
-    batch_size = 1
-    dummy_input = torch.randn(batch_size, 3, 720, 1080).to(device)
-
-    # 3. Export to ONNX
-    logger.info(f"Exporting model to {onnx_output_path}...")
-
-    try:
-        torch.onnx.export(
-            model,  # Model being run
-            dummy_input,  # Model input (or a tuple for multiple inputs)
-            onnx_output_path,  # Where to save the model
-            export_params=True,  # Store the trained parameter weights inside the model file
-            opset_version=11,  # The ONNX version to export the model to (11+ recommended)
-            do_constant_folding=True,  # Whether to execute constant folding for optimization
-            input_names=["input"],  # The model's input names
-            output_names=["output"],  # The model's output names
-            # Enable dynamic axes for variable batch size or resolutions
-            dynamic_axes={
-                "input": {0: "batch_size", 2: "height", 3: "width"},
-                "output": {0: "batch_size", 2: "out_height", 3: "out_width"},
-            },
-        )
-        logger.info("ONNX export complete.")
-    except Exception as e:
-        logger.error(f"ONNX export failed: {e}")
-
-
-if __name__ == "__main__":
-    CHECKPOINT = "../ckpts/shufflenet_best_model_214800.pth"
-    OUTPUT_ONNX = "../ckpts/shufflenet_best_model_214800.onnx"
-    export_to_onnx(CHECKPOINT, OUTPUT_ONNX)
-
-    import onnx
-
-    model = onnx.load(OUTPUT_ONNX)
-    onnx.checker.check_model(model)
-    print("ONNX Model check passed!")
