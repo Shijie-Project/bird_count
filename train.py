@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--warmup-epochs", type=int, default=5, help="linear warmup before cosine annealing")
     g.add_argument("--no-scheduler", action="store_true", help="disable LR scheduler entirely")
     g.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for the eval-time copy")
+    g.add_argument(
+        "--no-freeze-backbone-bn",
+        action="store_true",
+        help="train backbone BN running stats (default: frozen to ImageNet stats)",
+    )
 
     g = p.add_argument_group("loss (DM-Count + auxiliary)")
     g.add_argument("--wot", type=float, default=0.1, help="OT loss weight")
@@ -53,6 +58,11 @@ def parse_args() -> argparse.Namespace:
 
     g = p.add_argument_group("misc")
     g.add_argument("--seed", type=int, default=42)
+    g.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="enable cuDNN deterministic mode (slower; for fully reproducible runs)",
+    )
     g.add_argument("--device", default="0", help="CUDA_VISIBLE_DEVICES value (e.g. '0')")
     g.add_argument("--resume", default="", help="checkpoint to resume from (.tar or .pth)")
 
@@ -65,7 +75,7 @@ def main():
     # value already set in the shell takes precedence over the CLI default.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.device.strip())
 
-    set_seed(args.seed)  # also enables cudnn.benchmark
+    set_seed(args.seed, deterministic=args.deterministic)
     trainer = Trainer(args)
     trainer.setup()
     trainer.train()
