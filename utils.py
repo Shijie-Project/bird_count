@@ -1,201 +1,210 @@
+"""Project-wide utilities: seeding, checkpoint rotation, metric averaging, logging."""
+
 import logging
 import os
 import random
 import sys
 from collections import deque
+from typing import Union
 
-import cv2
 import numpy as np
 import torch
 
 
 logger = logging.getLogger(__name__)
 
+PathLike = Union[str, os.PathLike]
 
-def set_seed(seed):
-    """Set random seed for reproducibility."""
+
+def set_seed(seed: int, *, deterministic: bool = False) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs.
+
+    cuDNN defaults to `benchmark=True` (faster, non-deterministic algorithm
+    selection). Pass `deterministic=True` to swap to deterministic kernels at
+    the cost of speed.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    # For speed, we don't set deterministic to True unless debugging
-    # torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+        torch.cuda.manual_seed_all(seed)  # covers single and multi-GPU
+
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 class SaveHandle:
-    """
-    Manage checkpoint saving.
-    Keeps a maximum of `max_num` checkpoints, deleting the oldest one.
-    Refactored to use `collections.deque` for cleaner FIFO logic.
+    """Track a rolling window of up to `max_num` checkpoint files.
+
+    Each `append(path)` records the path; once the window is full, the oldest
+    file's path is popped and the file is deleted from disk.
     """
 
-    def __init__(self, max_num):
+    def __init__(self, max_num: int):
+        if max_num < 1:
+            raise ValueError(f"max_num must be >= 1, got {max_num}")
         self.max_num = max_num
-        self.save_queue = deque(maxlen=max_num)
+        self._queue: "deque[str]" = deque()
 
-    def append(self, save_path):
-        # If queue is full, deque automatically handles 'maxlen',
-        # but we need to physically delete the file of the item being pushed out.
-        if len(self.save_queue) == self.max_num:
-            # Get the oldest path (which is about to be removed from queue logic naturally)
-            oldest_path = self.save_queue[0]
-            self.remove_file(oldest_path)
+    def append(self, path: PathLike) -> None:
+        self._queue.append(os.fspath(path))
+        while len(self._queue) > self.max_num:
+            self._remove_file(self._queue.popleft())
 
-        self.save_queue.append(save_path)
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def __iter__(self):
+        return iter(self._queue)
 
     @staticmethod
-    def remove_file(path):
+    def _remove_file(path: str) -> None:
         try:
-            if os.path.exists(path):
-                os.remove(path)
-                logger.info(f"Removed old checkpoint: {path}")
-        except Exception as e:
+            os.remove(path)
+            logger.info(f"Removed old checkpoint: {path}")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
             logger.warning(f"Failed to remove {path}: {e}")
 
 
 class AverageMeter:
-    """Computes and stores the average and current value"""
+    """Streaming average of a scalar (or `.item()`-able tensor)."""
+
+    __slots__ = ("val", "avg", "sum", "count")
 
     def __init__(self):
         self.reset()
 
-    def reset(self):
-        self._val = 0
-        self._avg = 0
-        self._sum = 0
-        self._count = 0
+    def reset(self) -> None:
+        self.val = 0.0
+        self.avg = 0.0
+        self.sum = 0.0
+        self.count = 0
 
-    def update(self, val, n=1):
-        self._val = val
-        self._sum += val * n
-        self._count += n
-        self._avg = 1.0 * self._sum / self._count
+    def update(self, val, n: int = 1) -> None:
+        if hasattr(val, "item"):  # accept torch tensors transparently
+            val = val.item()
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
-    @property
-    def val(self):
-        return self._val
+    def __repr__(self) -> str:
+        return f"AverageMeter(val={self.val:.4g}, avg={self.avg:.4g}, n={self.count})"
 
-    @property
-    def avg(self):
-        return self._avg
 
-    @property
-    def count(self):
-        return self._count
+_DEFAULT_LOGGER_NAME = "PileUpProject"
+_DEFAULT_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
 
 class Logger:
-    """
-    Robust Logger wrapper.
-    Prevents duplicate logs if instantiated multiple times.
+    """Thin wrapper around `logging.getLogger` with file + console handlers.
+
+    Idempotent: re-instantiating with the same logger name reuses the existing
+    handlers instead of duplicating them. Forwards every method on the
+    underlying `logging.Logger` (info/warning/error/debug/critical/log/...).
     """
 
-    def __init__(self, log_file):
-        self.logger = logging.getLogger("PileUpProject")
+    def __init__(self, log_file: PathLike, name: str = _DEFAULT_LOGGER_NAME):
+        self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.DEBUG)
 
-        # Check if handlers already exist to prevent duplicate printing
         if not self.logger.handlers:
-            # File Handler
-            fh = logging.FileHandler(log_file)
-            fh.setLevel(logging.DEBUG)
+            formatter = logging.Formatter(_DEFAULT_FORMAT)
 
-            # Console Handler
             ch = logging.StreamHandler(sys.stdout)
             ch.setLevel(logging.INFO)
-
-            # Formatter
-            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
             ch.setFormatter(formatter)
+
+            fh = logging.FileHandler(os.fspath(log_file))
+            fh.setLevel(logging.DEBUG)
             fh.setFormatter(formatter)
 
             self.logger.addHandler(ch)
             self.logger.addHandler(fh)
 
-    def print_config(self, config):
-        """Print configuration dict in a readable table format"""
-        self.logger.info("=" * 40)
-        self.logger.info(f"{'Key':<20} | {'Value':<20}")
-        self.logger.info("-" * 40)
-        for k, v in config.items():
-            self.logger.info(f"{str(k):<20} | {str(v)}")
-        self.logger.info("=" * 40)
+    def print_config(self, config: dict) -> None:
+        """Log a config dict as a readable two-column table."""
+        rows = list(config.items())
+        if not rows:
+            self.logger.info("(empty config)")
+            return
+        key_w = max(len(str(k)) for k, _ in rows)
+        sep = "-" * (key_w + 30)
+        self.logger.info(sep)
+        for k, v in rows:
+            self.logger.info(f"{str(k):<{key_w}} | {v}")
+        self.logger.info(sep)
 
-    def info(self, msg):
-        self.logger.info(msg)
-
-    def warning(self, msg):
-        self.logger.warning(msg)
-
-    def error(self, msg):
-        self.logger.error(msg)
+    def __getattr__(self, name: str):
+        # Fallback when an attribute isn't defined on the wrapper itself
+        # (info/warning/error/debug/critical/log/...).
+        return getattr(self.logger, name)
 
 
-def visualize_save(img_tensor, pred_density, gt_density, save_path):
-    """
-    Visualize and save the comparison between:
-    [Original Image] | [GT Density] | [Pred Density]
+def visualize_save(img_tensor, pred_density, gt_density, save_path: PathLike) -> None:
+    """Save [image | GT density | pred density] side-by-side as a PNG.
 
     Args:
-        img_tensor: Tensor [3, H, W] (Normalized)
-        pred_density: Tensor [1, H, W] or [H, W]
-        gt_density: Tensor [1, H, W] or [H, W]
-        save_path: path to save the .png file
+        img_tensor: (3, H, W) ImageNet-normalized RGB tensor.
+        pred_density: (1, h', w') or (h', w') density map (tensor or array).
+        gt_density:  (1, h', w') or (h', w') density map (tensor or array).
+        save_path:   Output PNG path.
     """
+    import cv2  # heavy; lazy-imported.
 
-    # 1. Un-normalize Image (ImageNet stats)
-    # Mean: [0.485, 0.456, 0.406], Std: [0.229, 0.224, 0.225]
     mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
     std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
-
-    img = img_tensor.cpu().numpy()
-    img = (img * std + mean) * 255.0
-    img = np.clip(img, 0, 255).transpose(1, 2, 0).astype(np.uint8)  # [H, W, 3]
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert to BGR for OpenCV
-
+    img = img_tensor.detach().cpu().numpy()
+    img = ((img * std + mean) * 255.0).clip(0, 255).transpose(1, 2, 0).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     h, w = img.shape[:2]
 
-    def process_map(density_map, target_h, target_w):
-        if torch.is_tensor(density_map):
-            density_map = density_map.detach().cpu().numpy()
+    vis_gt = _density_to_heatmap(gt_density, w, h)
+    vis_pred = _density_to_heatmap(pred_density, w, h)
 
-        # Remove channel dim if exists
-        if density_map.ndim == 3:
-            density_map = density_map.squeeze(0)
+    sep = np.full((h, 10, 3), 255, dtype=np.uint8)
+    final = np.hstack([img, sep, vis_gt, sep, vis_pred])
 
-        # Normalize to 0-255 for visualization
-        if density_map.max() > 0:
-            norm_map = 255 * (density_map / density_map.max())
-        else:
-            norm_map = density_map
-
-        norm_map = np.clip(norm_map, 0, 255).astype(np.uint8)
-
-        # Apply JET Colormap (Red = High Density)
-        color_map = cv2.applyColorMap(norm_map, cv2.COLORMAP_JET)
-
-        # Resize to match original image size
-        color_map = cv2.resize(color_map, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-        return color_map
-
-    # 2. Process GT and Pred
-    vis_gt = process_map(gt_density, h, w)
-    vis_pred = process_map(pred_density, h, w)
-
-    # 3. Concatenate: Image | GT | Pred
-    sep_line = np.ones((h, 10, 3), dtype=np.uint8) * 255  # White separator
-    final_img = np.hstack((img, sep_line, vis_gt, sep_line, vis_pred))
-
-    # 4. Add Text info
-    gt_count = gt_density.sum()
-    pred_count = pred_density.sum()
-
-    cv2.putText(final_img, f"GT: {gt_count:.1f}", (w + 20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    gt_count = _scalar_sum(gt_density)
+    pred_count = _scalar_sum(pred_density)
     cv2.putText(
-        final_img, f"Pred: {pred_count:.1f}", (2 * w + 30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
+        final, f"GT: {gt_count:.1f}", (w + 20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA
+    )
+    cv2.putText(
+        final,
+        f"Pred: {pred_count:.1f}",
+        (2 * w + 30, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
     )
 
-    cv2.imwrite(save_path, final_img)
+    if not cv2.imwrite(os.fspath(save_path), final):
+        raise OSError(f"cv2.imwrite failed for {save_path!r}")
+
+
+def _density_to_heatmap(density, target_w: int, target_h: int) -> np.ndarray:
+    """Density map -> resized JET heatmap (H, W, 3) BGR."""
+    import cv2
+
+    if torch.is_tensor(density):
+        density = density.detach().cpu().numpy()
+    density = np.asarray(density)
+    if density.ndim == 3:
+        density = density.squeeze(0)
+    vmax = float(density.max())
+    norm = (density / vmax) * 255.0 if vmax > 0 else density
+    norm = np.clip(norm, 0, 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+    return cv2.resize(heatmap, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+
+
+def _scalar_sum(x) -> float:
+    if torch.is_tensor(x):
+        return float(x.sum().item())
+    return float(np.asarray(x).sum())

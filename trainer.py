@@ -1,237 +1,263 @@
-import os
+"""Training orchestration for the chicken-density model.
+
+`Trainer.setup()` builds the data pipeline, model + EMA + scheduler, and the
+combined DM-Count loss. `Trainer.train()` runs the train/val loop, saves a
+checkpoint per epoch, and tracks a single best-model file by (2*MSE + MAE).
+"""
+
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader
-from torch.utils.data.dataloader import default_collate
 
+from datasets import collate, seed_worker
 from datasets.bird import Bird
-from losses.ot_loss import OT_Loss
+from losses import DMCountLoss
+from models.ema import ModelEMA
+from models.shufflenet import get_shufflenet_density_model
 from utils import AverageMeter, Logger, SaveHandle
 
 
-def train_collate(batch):
-    transposed_batch = list(zip(*batch))
-    images = torch.stack(transposed_batch[0], 0)
-    points = transposed_batch[1]  # the number of points is not fixed, keep it as a list of tensor
-    gt_discretes = torch.stack(transposed_batch[2], 0)
-    return images, points, gt_discretes
+_DOWNSAMPLE_RATIO = 8
+_LOSS_KEYS = ("loss", "ot", "count", "tv", "aux", "wd", "ot_obj", "mae", "mse")
 
 
 class Trainer:
     def __init__(self, args):
         self.args = args
+        self.epoch = 0
+        self.start_epoch = 0
+        self.best_mae = float("inf")
+        self.best_mse = float("inf")
+
+    # ----- setup -------------------------------------------------------------
 
     def setup(self):
-        args = self.args
-        sub_dir = "input-{}_wot-{}_wtv-{}_reg-{}_nIter-{}_normCood-{}/{}".format(
-            args.crop_size,
-            args.wot,
-            args.wtv,
-            args.reg,
-            args.num_of_iter_in_ot,
-            int(args.norm_cood),
-            time.strftime("%Y%m%d-%H%M%S"),
-        )
-
-        self.save_dir = os.path.join(args.checkpoint_dir, sub_dir)
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
-
-        time_str = datetime.strftime(datetime.now(), "%m%d-%H%M%S")
-        self.logger = Logger(os.path.join(self.save_dir, f"train-{time_str:s}.log"))
-        self.logger.info(vars(args))
-
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            self.device_count = torch.cuda.device_count()
-            assert self.device_count == 1
-            self.logger.info(f"using {self.device_count} gpus")
-        else:
-            raise Exception("gpu is not available")
-
-        downsample_ratio = 8
-        data_suffix = "_legacy" if args.legacy_data else ""
-        self.datasets = {
-            "train": Bird(args.data_dir, args.crop_size, downsample_ratio, "train" + data_suffix),
-            "val": Bird(args.data_dir, args.crop_size, downsample_ratio, "val" + data_suffix),
-        }
-
-        self.dataloaders = {
-            x: DataLoader(
-                self.datasets[x],
-                collate_fn=(train_collate if x == "train" else default_collate),
-                batch_size=(args.batch_size if x == "train" else 1),
-                shuffle=(True if x == "train" else False),
-                num_workers=args.num_workers * self.device_count,
-                pin_memory=(True if x == "train" else False),
-                persistent_workers=True,
-            )
-            for x in ["train", "val"]
-        }
-        if args.model == "vgg":
-            from models.vgg import get_vgg19_density_model
-
-            self.model = get_vgg19_density_model()
-
-        elif args.model == "shufflenet":
-            from models.shufflenet import get_shufflenet_density_model
-
-            self.model = get_shufflenet_density_model()
-
-        self.model.to(self.device)
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-        self.start_epoch = 0
-        if args.resume:
-            self.logger.info("loading pretrained model from " + args.resume)
-            suf = args.resume.rsplit(".", 1)[-1]
-            if suf == "tar":
-                checkpoint = torch.load(args.resume, self.device)
-                self.model.load_state_dict(checkpoint["model_state_dict"])
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                self.start_epoch = checkpoint["epoch"] + 1
-            elif suf == "pth":
-                self.model.load_state_dict(torch.load(args.resume, self.device))
-        else:
-            self.logger.info("random initialization")
-
-        self.ot_loss = OT_Loss(
-            args.crop_size, downsample_ratio, args.norm_cood, self.device, args.num_of_iter_in_ot, args.reg
-        )
-        self.tv_loss = nn.L1Loss(reduction="none").to(self.device)
-        self.mse = nn.MSELoss().to(self.device)
-        self.mae = nn.L1Loss().to(self.device)
+        self._require_cuda()
+        self._setup_save_dir()
+        self._setup_logging()
+        self._setup_data()
+        self._setup_model_and_optim()
+        resumed_ema_state = self._maybe_resume()
+        self._setup_ema(resumed_ema_state)
         self.save_list = SaveHandle(max_num=1)
-        self.best_mae = np.inf
-        self.best_mse = np.inf
-        self.best_count = 0
+
+    def _require_cuda(self):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available; this trainer requires a GPU.")
+        n = torch.cuda.device_count()
+        if n != 1:
+            raise RuntimeError(f"Expected exactly 1 visible GPU; found {n}. Set CUDA_VISIBLE_DEVICES to one device.")
+        self.device = torch.device("cuda")
+
+    def _setup_save_dir(self):
+        a = self.args
+        sub = (
+            f"input-{a.crop_size}_wot-{a.wot}_wtv-{a.wtv}_waux-{a.waux}"
+            f"_reg-{a.reg}_nIter-{a.num_of_iter_in_ot}_normCood-{int(a.norm_cood)}"
+            f"/{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        self.save_dir = Path(a.checkpoint_dir) / sub
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _setup_logging(self):
+        time_str = datetime.now().strftime("%m%d-%H%M%S")
+        self.logger = Logger(str(self.save_dir / f"train-{time_str}.log"))
+        self.logger.print_config(vars(self.args))
+        self.logger.info(f"using GPU: {torch.cuda.get_device_name(0)}")
+
+    def _setup_data(self):
+        a = self.args
+        self.datasets = {split: Bird(a.data_dir, a.crop_size, _DOWNSAMPLE_RATIO, split) for split in ("train", "val")}
+        self.dataloaders = {
+            "train": self._make_loader("train", batch_size=a.batch_size, shuffle=True, pin_memory=True),
+            "val": self._make_loader("val", batch_size=1, shuffle=False, pin_memory=False),
+        }
+
+    def _make_loader(self, split: str, *, batch_size: int, shuffle: bool, pin_memory: bool) -> DataLoader:
+        nw = self.args.num_workers
+        return DataLoader(
+            self.datasets[split],
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=nw,
+            collate_fn=collate,
+            pin_memory=pin_memory,
+            persistent_workers=nw > 0,
+            worker_init_fn=seed_worker,
+        )
+
+    def _setup_model_and_optim(self):
+        a = self.args
+        self.model = get_shufflenet_density_model().to(self.device)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
+        self.scheduler = self._build_scheduler()
+        self.loss_fn = DMCountLoss(
+            a.crop_size,
+            _DOWNSAMPLE_RATIO,
+            a.norm_cood,
+            self.device,
+            wot=a.wot,
+            wtv=a.wtv,
+            wcount=a.wcount,
+            waux=a.waux,
+            aux_sigma=a.aux_sigma,
+            dense_weight_alpha=a.dense_weight_alpha,
+            num_of_iter_in_ot=a.num_of_iter_in_ot,
+            reg=a.reg,
+        )
+
+    def _build_scheduler(self):
+        a = self.args
+        if a.no_scheduler:
+            return None
+        warmup = max(a.warmup_epochs, 1)
+        cosine = max(a.max_epoch - warmup, 1)
+        return optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[
+                optim.lr_scheduler.LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup),
+                optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=cosine, eta_min=a.lr * 0.01),
+            ],
+            milestones=[warmup],
+        )
+
+    def _maybe_resume(self) -> Optional[dict]:
+        """Return the EMA state-dict captured from a `.tar` resume, or None."""
+        path = self.args.resume
+        if not path:
+            self.logger.info("training from random init")
+            return None
+
+        self.logger.info(f"resuming from {path}")
+        suffix = Path(path).suffix.lower()
+        ckpt = torch.load(path, map_location=self.device)
+        if suffix == ".tar":
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            sched_state = ckpt.get("scheduler_state_dict")
+            if self.scheduler is not None and sched_state is not None:
+                self.scheduler.load_state_dict(sched_state)
+            self.start_epoch = ckpt["epoch"] + 1
+            return ckpt.get("ema_state_dict")
+        if suffix == ".pth":
+            self.model.load_state_dict(ckpt)
+            return None
+        raise ValueError(f"unknown checkpoint extension {suffix!r}; expected .tar or .pth")
+
+    def _setup_ema(self, resumed_ema_state: Optional[dict]):
+        # EMA must be created AFTER weights are loaded — it deepcopies the model.
+        self.ema = ModelEMA(self.model, decay=self.args.ema_decay)
+        if resumed_ema_state is not None:
+            self.ema.ema.load_state_dict(resumed_ema_state)
+
+    # ----- training loop -----------------------------------------------------
 
     def train(self):
-        """training process"""
-        args = self.args
-        for epoch in range(self.start_epoch, args.max_epoch + 1):
-            self.logger.info("-" * 5 + f"Epoch {epoch}/{args.max_epoch}" + "-" * 5)
+        for epoch in range(self.start_epoch, self.args.max_epoch + 1):
             self.epoch = epoch
-            self.train_eopch()
-            if epoch % args.val_epoch == 0 and epoch >= args.val_start:
+            self.logger.info(f"---- Epoch {epoch}/{self.args.max_epoch} ----")
+            self.train_epoch()
+            if self._should_validate():
                 self.val_epoch()
+            if self.scheduler is not None:
+                self.scheduler.step()
 
-    def train_eopch(self):
-        epoch_ot_loss = AverageMeter()
-        epoch_ot_obj_value = AverageMeter()
-        epoch_wd = AverageMeter()
-        epoch_count_loss = AverageMeter()
-        epoch_tv_loss = AverageMeter()
-        epoch_loss = AverageMeter()
-        epoch_mae = AverageMeter()
-        epoch_mse = AverageMeter()
-        epoch_start = time.time()
+    def _should_validate(self) -> bool:
+        a = self.args
+        return self.epoch >= a.val_start and (self.epoch % a.val_epoch == 0)
 
-        self.model.train()  # Set model to training mode
+    def train_epoch(self):
+        self.model.train()
+        meters = {k: AverageMeter() for k in _LOSS_KEYS}
+        t0 = time.time()
 
-        for step, (inputs, points, gt_discrete) in enumerate(self.dataloaders["train"]):
-            inputs = inputs.to(self.device)
-            gd_count = np.array([len(p) for p in points], dtype=np.float32)
-            points = [p.to(self.device) for p in points]
-            gt_discrete = gt_discrete.to(self.device)
+        for sample in self.dataloaders["train"]:
+            inputs = sample["image"].to(self.device, non_blocking=True)
+            points = [p.to(self.device, non_blocking=True) for p in sample["keypoints"]]
+            gt_density = sample["density"].to(self.device, non_blocking=True)
             N = inputs.size(0)
 
-            with torch.set_grad_enabled(True):
-                outputs = self.model(inputs)
-                outputs_normed = outputs / (outputs.view([N, -1]).sum(1).unsqueeze(1).unsqueeze(2).unsqueeze(3) + 1e-6)
+            outputs = self.model(inputs)
+            total, parts = self.loss_fn(outputs, gt_density, points)
 
-                # Compute OT loss.
-                ot_loss, wd, ot_obj_value = self.ot_loss(outputs_normed, outputs, points)
-                ot_loss = ot_loss * self.args.wot
-                ot_obj_value = ot_obj_value * self.args.wot
-                epoch_ot_loss.update(ot_loss.item(), N)
-                epoch_ot_obj_value.update(ot_obj_value.item(), N)
-                epoch_wd.update(wd, N)
+            self.optimizer.zero_grad(set_to_none=True)
+            total.backward()
+            self.optimizer.step()
+            self.ema.update(self.model)
 
-                # Compute counting loss.
-                count_loss = self.mae(outputs.sum(1).sum(1).sum(1), torch.from_numpy(gd_count).float().to(self.device))
-                epoch_count_loss.update(count_loss.item(), N)
+            self._update_meters(meters, total, parts, outputs, points, N)
 
-                # Compute TV loss.
-                gd_count_tensor = (
-                    torch.from_numpy(gd_count).float().to(self.device).unsqueeze(1).unsqueeze(2).unsqueeze(3)
-                )
-                gt_discrete_normed = gt_discrete / (gd_count_tensor + 1e-6)
-                tv_loss = (
-                    self.tv_loss(outputs_normed, gt_discrete_normed).sum(1).sum(1).sum(1)
-                    * torch.from_numpy(gd_count).float().to(self.device)
-                ).mean(0) * self.args.wtv
-                epoch_tv_loss.update(tv_loss.item(), N)
+        self.logger.info(self._format_train_log(meters, time.time() - t0))
+        self._save_epoch_checkpoint()
 
-                loss = ot_loss + count_loss + tv_loss
+    def _update_meters(self, meters, total, parts, outputs, points, N):
+        with torch.no_grad():
+            pred_count = outputs.view(N, -1).sum(dim=1)
+            gd_count = torch.tensor([len(p) for p in points], device=self.device, dtype=torch.float32)
+            err = (pred_count - gd_count).cpu().numpy()
+        meters["loss"].update(total.item(), N)
+        for k, v in parts.items():
+            meters[k].update(v, N)
+        meters["mae"].update(float(np.mean(np.abs(err))), N)
+        meters["mse"].update(float(np.mean(err * err)), N)
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-                pred_count = torch.sum(outputs.view(N, -1), dim=1).detach().cpu().numpy()
-                pred_err = pred_count - gd_count
-                epoch_loss.update(loss.item(), N)
-                epoch_mse.update(np.mean(pred_err * pred_err), N)
-                epoch_mae.update(np.mean(abs(pred_err)), N)
-
-        self.logger.info(
-            "Epoch {} Train, Loss: {:.2f}, OT Loss: {:.2e}, Wass Distance: {:.2f}, OT obj value: {:.2f}, "
-            "Count Loss: {:.2f}, TV Loss: {:.2f}, MSE: {:.2f} MAE: {:.2f}, Cost {:.1f} sec".format(
-                self.epoch,
-                epoch_loss.avg,
-                epoch_ot_loss.avg,
-                epoch_wd.avg,
-                epoch_ot_obj_value.avg,
-                epoch_count_loss.avg,
-                epoch_tv_loss.avg,
-                np.sqrt(epoch_mse.avg),
-                epoch_mae.avg,
-                time.time() - epoch_start,
-            )
+    def _format_train_log(self, meters, dt: float) -> str:
+        lr = self.optimizer.param_groups[0]["lr"]
+        return (
+            f"Epoch {self.epoch} Train | lr {lr:.2e} | loss {meters['loss'].avg:.2f} "
+            f"| ot {meters['ot'].avg:.2e} | wass {meters['wd'].avg:.2f} "
+            f"| count {meters['count'].avg:.2f} | tv {meters['tv'].avg:.2f} "
+            f"| aux {meters['aux'].avg:.2f} "
+            f"| MSE {np.sqrt(meters['mse'].avg):.2f} | MAE {meters['mae'].avg:.2f} "
+            f"| {dt:.1f}s"
         )
-        model_state_dic = self.model.state_dict()
-        save_path = os.path.join(self.save_dir, f"{self.epoch}_ckpt.tar")
+
+    @torch.inference_mode()
+    def val_epoch(self):
+        eval_model = self.ema.ema
+        eval_model.eval()
+        residuals = []
+        t0 = time.time()
+
+        for sample in self.dataloaders["val"]:
+            inputs = sample["image"].to(self.device, non_blocking=True)
+            if inputs.size(0) != 1:
+                raise RuntimeError(f"val batch size must be 1, got {inputs.size(0)}")
+            outputs = eval_model(inputs)
+            residuals.append(sample["density"].sum().item() - outputs.sum().item())
+
+        residuals = np.asarray(residuals)
+        mse = float(np.sqrt(np.mean(residuals**2)))
+        mae = float(np.mean(np.abs(residuals)))
+        self.logger.info(f"Epoch {self.epoch} Val (EMA) | MSE {mse:.2f} | MAE {mae:.2f} | {time.time() - t0:.1f}s")
+
+        if self._is_best(mse, mae):
+            self.best_mse, self.best_mae = mse, mae
+            best_path = self.save_dir / f"best_ep{self.epoch:04d}_mae{mae:.2f}_mse{mse:.2f}.pth"
+            torch.save(self.ema.ema.state_dict(), best_path)
+            self.logger.info(f"saved best -> {best_path.name}")
+
+    def _is_best(self, mse: float, mae: float) -> bool:
+        return (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae)
+
+    # ----- checkpoints -------------------------------------------------------
+
+    def _save_epoch_checkpoint(self):
+        path = self.save_dir / f"{self.epoch}_ckpt.tar"
         torch.save(
             {
                 "epoch": self.epoch,
+                "model_state_dict": self.model.state_dict(),
+                "ema_state_dict": self.ema.ema.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
-                "model_state_dict": model_state_dic,
+                "scheduler_state_dict": (self.scheduler.state_dict() if self.scheduler is not None else None),
             },
-            save_path,
+            path,
         )
-        self.save_list.append(save_path)
-
-    def val_epoch(self):
-        epoch_start = time.time()
-        self.model.eval()  # Set model to evaluate mode
-        epoch_res = []
-        for img, inputs, gt_discrete, name in self.dataloaders["val"]:
-            inputs = inputs.to(self.device)
-            assert inputs.size(0) == 1, "the batch size should equal to 1 in validation mode"
-            with torch.set_grad_enabled(False):
-                outputs = self.model(inputs)
-                res = gt_discrete[0].sum().item() - torch.sum(outputs).item()
-                epoch_res.append(res)
-
-        epoch_res = np.array(epoch_res)
-        mse = np.sqrt(np.mean(np.square(epoch_res)))
-        mae = np.mean(np.abs(epoch_res))
-        self.logger.info(
-            "Epoch {} Val, MSE: {:.2f} MAE: {:.2f}, Cost {:.1f} sec".format(
-                self.epoch, mse, mae, time.time() - epoch_start
-            )
-        )
-
-        model_state_dic = self.model.state_dict()
-        if (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae):
-            self.best_mse = mse
-            self.best_mae = mae
-            self.logger.info(f"save best mse {self.best_mse:.2f} mae {self.best_mae:.2f} model epoch {self.epoch}")
-            torch.save(model_state_dic, os.path.join(self.save_dir, f"best_model_{self.best_count}.pth"))
-            self.best_count += 1
+        self.save_list.append(str(path))
