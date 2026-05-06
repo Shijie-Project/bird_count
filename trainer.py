@@ -15,15 +15,13 @@ import torch
 from torch import optim
 from torch.utils.data import DataLoader
 
-from datasets import collate, seed_worker
-from datasets.bird import Bird
+from datasets import DOWNSAMPLE_RATIO, Bird, collate, seed_worker
 from losses import DMCountLoss
 from models.ema import ModelEMA
 from models.shufflenet import get_shufflenet_density_model
 from utils import AverageMeter, Logger, SaveHandle
 
 
-_DOWNSAMPLE_RATIO = 8
 _LOSS_KEYS = ("loss", "ot", "count", "tv", "aux", "wd", "ot_obj", "mae", "mse")
 
 
@@ -73,7 +71,7 @@ class Trainer:
 
     def _setup_data(self):
         a = self.args
-        self.datasets = {split: Bird(a.data_dir, a.crop_size, _DOWNSAMPLE_RATIO, split) for split in ("train", "val")}
+        self.datasets = {split: Bird(a.data_dir, a.crop_size, DOWNSAMPLE_RATIO, split) for split in ("train", "val")}
         self.dataloaders = {
             "train": self._make_loader("train", batch_size=a.batch_size, shuffle=True, pin_memory=True),
             "val": self._make_loader("val", batch_size=1, shuffle=False, pin_memory=False),
@@ -94,12 +92,15 @@ class Trainer:
 
     def _setup_model_and_optim(self):
         a = self.args
-        self.model = get_shufflenet_density_model().to(self.device)
+        self.model = get_shufflenet_density_model(
+            device=self.device,
+            freeze_backbone_bn=not getattr(a, "no_freeze_backbone_bn", False),
+        )
         self.optimizer = optim.AdamW(self.model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
         self.scheduler = self._build_scheduler()
         self.loss_fn = DMCountLoss(
             a.crop_size,
-            _DOWNSAMPLE_RATIO,
+            DOWNSAMPLE_RATIO,
             a.norm_cood,
             self.device,
             wot=a.wot,
@@ -136,7 +137,7 @@ class Trainer:
 
         self.logger.info(f"resuming from {path}")
         suffix = Path(path).suffix.lower()
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if suffix == ".tar":
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -144,9 +145,11 @@ class Trainer:
             if self.scheduler is not None and sched_state is not None:
                 self.scheduler.load_state_dict(sched_state)
             self.start_epoch = ckpt["epoch"] + 1
+            self.logger.info(f"resumed at epoch {self.start_epoch} (next training epoch)")
             return ckpt.get("ema_state_dict")
         if suffix == ".pth":
             self.model.load_state_dict(ckpt)
+            self.logger.info("resumed model weights only (.pth); optimizer/scheduler/EMA re-initialized")
             return None
         raise ValueError(f"unknown checkpoint extension {suffix!r}; expected .tar or .pth")
 
