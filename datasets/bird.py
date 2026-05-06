@@ -1,111 +1,113 @@
 import os
-import random
 from glob import glob
 
 import numpy as np
 import torch
 import torch.utils.data as data
-import torchvision.transforms.functional as F
 from PIL import Image
-from torchvision import transforms
 
-from .utils import gen_discrete_map, random_crop
+from . import transforms as T
+from .targets import downsample_count_map, gen_discrete_map
+
+
+def build_train_transform(
+    crop_size,
+    scale_range=(0.8, 1.25),
+    color_jitter=(0.4, 0.4, 0.3, 0.05),
+    gamma_range=(0.7, 1.3),
+    gamma_p=0.5,
+    noise_std=0.02,
+    noise_p=0.5,
+    hflip_p=0.5,
+    vflip_p=0.5,
+):
+    return T.Compose(
+        [
+            T.RandomScale(scale_range),
+            T.RandomSquareCrop(crop_size),
+            T.RandomHFlip(hflip_p),
+            T.RandomVFlip(vflip_p),
+            T.RandomRot90(),
+            T.ColorJitter(*color_jitter),
+            T.RandomGamma(gamma_range, gamma_p),
+            T.ToTensor(),
+            T.Normalize(),
+            T.RandomGaussianNoise(noise_std, noise_p),
+        ]
+    )
+
+
+def build_val_transform():
+    return T.Compose([T.ToTensor(), T.Normalize()])
 
 
 class Bird(data.Dataset):
-    def __init__(self, root_path, crop_size, downsample_ratio=8, split="train"):
+    """Counting dataset returning (image, keypoints, density) tuples.
+
+    Train sample: (image[3, c, c], keypoints[N, 2], gt[1, c/d, c/d])
+    Val sample:   (img_path, image[3, h, w], gt[h/d, w/d], name)
+    """
+
+    def __init__(
+        self,
+        root_path,
+        crop_size,
+        downsample_ratio=8,
+        split="train",
+        transform=None,
+        train_aug=None,
+    ):
+        if crop_size % downsample_ratio:
+            raise ValueError(f"crop_size {crop_size} not divisible by downsample_ratio {downsample_ratio}")
+
         self.root_path = root_path
         self.c_size = crop_size
         self.d_ratio = downsample_ratio
-        assert self.c_size % self.d_ratio == 0
-        self.dc_size = self.c_size // self.d_ratio
-        self.trans = transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-        )
-
         self.split = split
-        assert split in ("train", "val", "train_legacy", "val_legacy")
+        self.is_train = "train" in split
 
-        self.im_list = list(glob(os.path.join(self.root_path, "images", split, "*.jpg")))
-        self.im_list.sort()
+        if transform is None:
+            transform = (
+                build_train_transform(crop_size, **(train_aug or {})) if self.is_train else build_val_transform()
+            )
+        self.transform = transform
+
+        self.im_list = sorted(glob(os.path.join(root_path, "images", split, "*.jpg")))
         print(f"number of img: {len(self.im_list)}")
 
     def __len__(self):
         return len(self.im_list)
 
-    def __getitem__(self, item):
-        img_path = self.im_list[item]
-
-        name = os.path.basename(img_path).split(".")[0]
+    def __getitem__(self, idx):
+        img_path = self.im_list[idx]
+        name = os.path.splitext(os.path.basename(img_path))[0]
 
         img = Image.open(img_path).convert("RGB")
-        w, h = img.size
+        ann_path = os.path.join(self.root_path, "annotations", self.split, name + ".txt")
+        keypoints = self._load_keypoints(ann_path, img.size)
 
-        keypoints = np.loadtxt(os.path.join(self.root_path, "annotations", self.split, name + ".txt"), ndmin=2)
-        keypoints = np.array(keypoints)
+        img, keypoints = self.transform(img, keypoints)
 
-        if keypoints.shape[1] == 3:
-            keypoints = keypoints[:, 1:] * np.array([w, h])
+        # img is now a normalized (3, H, W) tensor; keypoints are still numpy in image coords.
+        h, w = img.shape[-2:]
+        density = gen_discrete_map(h, w, keypoints)
+        density = downsample_count_map(density, self.d_ratio)
 
-        if "train" in self.split:
-            return self.train_transform(img, keypoints)
-
-        img = self.trans(img)
-
-        gt_discrete = gen_discrete_map(h, w, keypoints)
-        down_w = w // self.d_ratio
-        down_h = h // self.d_ratio
-        gt_discrete = gt_discrete.reshape([down_h, self.d_ratio, down_w, self.d_ratio]).sum(axis=(1, 3))
-        assert np.sum(gt_discrete) == len(keypoints)
-
-        return img_path, img, gt_discrete, name
-
-    def train_transform(self, img, keypoints):
-        wd, ht = img.size
-        st_size = 1.0 * min(wd, ht)
-        # resize the image to fit the crop size
-        if st_size < self.c_size:
-            rr = 1.0 * self.c_size / st_size
-            wd = round(wd * rr)
-            ht = round(ht * rr)
-            st_size = 1.0 * min(wd, ht)
-            img = img.resize((wd, ht), Image.BICUBIC)
-            keypoints = keypoints * rr
-
-        assert st_size >= self.c_size, print(wd, ht)
-        assert len(keypoints) >= 0
-
-        i, j, h, w = random_crop(ht, wd, self.c_size, self.c_size)
-        img = F.crop(img, i, j, h, w)
-        if len(keypoints) > 0:
-            keypoints = keypoints - [j, i]
-            idx_mask = (
-                (keypoints[:, 0] >= 0) * (keypoints[:, 0] <= w) * (keypoints[:, 1] >= 0) * (keypoints[:, 1] <= h)
+        if self.is_train:
+            return (
+                img,
+                torch.from_numpy(np.ascontiguousarray(keypoints)).float(),
+                torch.from_numpy(density).float().unsqueeze(0),
             )
-            keypoints = keypoints[idx_mask]
-        else:
-            keypoints = np.empty([0, 2])
+        return img_path, img, torch.from_numpy(density).float(), name
 
-        gt_discrete = gen_discrete_map(h, w, keypoints)
-        down_w = w // self.d_ratio
-        down_h = h // self.d_ratio
-        gt_discrete = gt_discrete.reshape([down_h, self.d_ratio, down_w, self.d_ratio]).sum(axis=(1, 3))
-        assert np.sum(gt_discrete) == len(keypoints)
-
-        if len(keypoints) > 0:
-            if random.random() > 0.5:
-                img = F.hflip(img)
-                gt_discrete = np.fliplr(gt_discrete)
-                keypoints[:, 0] = w - keypoints[:, 0] - 1
-        else:
-            if random.random() > 0.5:
-                img = F.hflip(img)
-                gt_discrete = np.fliplr(gt_discrete)
-
-        gt_discrete = np.expand_dims(gt_discrete, 0)
-
-        return (
-            self.trans(img),
-            torch.from_numpy(keypoints.copy()).float(),
-            torch.from_numpy(gt_discrete.copy()).float(),
-        )
+    @staticmethod
+    def _load_keypoints(path, img_size):
+        w, h = img_size
+        kps = np.loadtxt(path, ndmin=2)
+        if kps.size == 0:
+            return np.empty((0, 2))
+        if kps.shape[1] == 3:
+            # YOLO-style "class x_norm y_norm" → (x, y) in pixels.
+            kps = kps[:, 1:] * np.array([w, h])
+        return kps
