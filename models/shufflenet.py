@@ -91,7 +91,11 @@ class ShuffleNetDensityNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         f2, f3 = self.backbone(x)
-        f3_up = F.interpolate(f3, scale_factor=2, mode="bilinear", align_corners=False)
+        # Resize stage3 to match stage2 *exactly*. `scale_factor=2` would be
+        # off-by-one whenever stage2 has an odd spatial dim (i.e. input is
+        # divisible by 8 but not 16), e.g. H=1080 -> stage2=135, stage3=68,
+        # and 2*68=136 != 135. Size-matched interpolation handles this.
+        f3_up = F.interpolate(f3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
         fused = torch.cat([f2, f3_up], dim=1)
         x = self.reg_layer(fused)
         return self.density_layer(x)
