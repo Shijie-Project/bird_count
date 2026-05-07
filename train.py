@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     g = p.add_argument_group("evaluation")
     g.add_argument("--val-epoch", type=int, default=5, help="run validation every N epochs")
     g.add_argument("--val-start", type=int, default=30, help="first epoch eligible for validation")
+    g.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="early stop after this many consecutive validations without improvement; 0 disables",
+    )
 
     g = p.add_argument_group("misc")
     g.add_argument("--seed", type=int, default=42)

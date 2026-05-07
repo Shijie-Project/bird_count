@@ -32,6 +32,9 @@ class Trainer:
         self.start_epoch = 0
         self.best_mae = float("inf")
         self.best_mse = float("inf")
+        # Consecutive validation runs since the last best-model improvement.
+        # Reset on every new best; drives early stopping when patience is set.
+        self.evals_since_improvement = 0
 
     # ----- setup -------------------------------------------------------------
 
@@ -171,12 +174,23 @@ class Trainer:
             self.train_epoch()
             if self._should_validate():
                 self.val_epoch()
+                if self._should_early_stop():
+                    self.logger.info(
+                        f"Early stopping at epoch {epoch}: "
+                        f"{self.evals_since_improvement} consecutive eval(s) without improvement "
+                        f"(patience={self.args.patience})."
+                    )
+                    break
             if self.scheduler is not None:
                 self.scheduler.step()
 
     def _should_validate(self) -> bool:
         a = self.args
         return self.epoch >= a.val_start and (self.epoch % a.val_epoch == 0)
+
+    def _should_early_stop(self) -> bool:
+        patience = getattr(self.args, "patience", 0) or 0
+        return patience > 0 and self.evals_since_improvement >= patience
 
     def train_epoch(self):
         self.model.train()
@@ -254,10 +268,17 @@ class Trainer:
 
         if self._is_best(mse, mae):
             self.best_mse, self.best_mae = mse, mae
+            self.evals_since_improvement = 0
             best_path = self.save_dir / f"best_ep{self.epoch:04d}_mae{mae:.2f}_mse{mse:.2f}.pth"
             torch.save(self.ema.ema.state_dict(), best_path)
             self.best_save_list.append(best_path)  # rotates older best_*.pth out
             self.logger.info(f"saved best -> {best_path.name}")
+        else:
+            self.evals_since_improvement += 1
+            self.logger.info(
+                f"no improvement for {self.evals_since_improvement} consecutive eval(s) "
+                f"(patience={getattr(self.args, 'patience', 0)})"
+            )
 
     def _is_best(self, mse: float, mae: float) -> bool:
         return (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae)
