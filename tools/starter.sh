@@ -21,6 +21,8 @@ case "$cmd" in
         exec streamlit run tools/visualize_data.py
         ;;
     label-studio | label_studio)
+        export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED="true"
+        export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT="C:/Shijie_Li/bird_pileup/code/data"
         exec label-studio start --data-dir ../data
         ;;
     -h | --help | "")
