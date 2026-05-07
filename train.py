@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="train backbone BN running stats (default: frozen to ImageNet stats)",
     )
+    g.add_argument(
+        "--max-best-ckpts",
+        type=int,
+        default=5,
+        help="keep at most N best-model .pth files; older ones are deleted on rotation",
+    )
 
     g = p.add_argument_group("loss (DM-Count + auxiliary)")
     g.add_argument("--wot", type=float, default=0.1, help="OT loss weight")

@@ -43,7 +43,10 @@ class Trainer:
         self._setup_model_and_optim()
         resumed_ema_state = self._maybe_resume()
         self._setup_ema(resumed_ema_state)
+
+        # Rolling caps on disk: 1 epoch checkpoint (.tar) + N best-model files (.pth).
         self.save_list = SaveHandle(max_num=1)
+        self.best_save_list = SaveHandle(max_num=max(1, self.args.max_best_ckpts))
 
     def _require_cuda(self):
         if not torch.cuda.is_available():
@@ -253,6 +256,7 @@ class Trainer:
             self.best_mse, self.best_mae = mse, mae
             best_path = self.save_dir / f"best_ep{self.epoch:04d}_mae{mae:.2f}_mse{mse:.2f}.pth"
             torch.save(self.ema.ema.state_dict(), best_path)
+            self.best_save_list.append(best_path)  # rotates older best_*.pth out
             self.logger.info(f"saved best -> {best_path.name}")
 
     def _is_best(self, mse: float, mae: float) -> bool:
