@@ -1,5 +1,5 @@
+import json
 import os
-from glob import glob
 
 import numpy as np
 import torch
@@ -36,7 +36,7 @@ def build_train_transform(
             T.ColorJitter(*color_jitter),
             T.RandomGamma(gamma_range, gamma_p),
             T.ToTensor(),
-            T.Normalize(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             T.RandomGaussianNoise(noise_std, noise_p),
         ]
     )
@@ -49,7 +49,13 @@ def build_val_transform(downsample_ratio: int = DOWNSAMPLE_RATIO):
     not be divisible by the model's output stride; without it
     `downsample_count_map` would raise on the next line.
     """
-    return T.Compose([T.ToTensor(), T.Normalize(), T.PadToMultiple(downsample_ratio)])
+    return T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            T.PadToMultiple(downsample_ratio),
+        ],
+    )
 
 
 class Bird(data.Dataset):
@@ -84,7 +90,25 @@ class Bird(data.Dataset):
             )
         self.transform = transform
 
-        self.im_list = sorted(glob(os.path.join(root_path, "images", split, "*.jpg")))
+        ann_json = os.path.join(root_path, "annotations", f"{split}.json")
+        if not os.path.exists(ann_json):
+            raise FileNotFoundError(
+                f"Annotation JSON not found: {ann_json}. "
+                "Run tools/yolo_to_coco_converter.py to generate it from the per-file txts."
+            )
+        with open(ann_json, encoding="utf-8") as f:
+            coco = json.load(f)
+
+        # stem -> (N, 2) array of [x_px, y_px] points
+        self._points_by_name: dict[str, np.ndarray] = {}
+        for ann in coco.get("annotations", []):
+            stem = str(ann["image_id"])
+            pts = ann.get("points", [])
+            self._points_by_name[stem] = np.asarray(pts, dtype=np.float64).reshape(-1, 2) if pts else np.empty((0, 2))
+
+        img_dir = os.path.join(root_path, "images", split)
+        im_list = [os.path.join(img_dir, str(img["file_name"])) for img in coco.get("images", [])]
+        self.im_list = sorted(im_list)
         print(f"number of img: {len(self.im_list)}")
 
     def __len__(self):
@@ -95,8 +119,7 @@ class Bird(data.Dataset):
         name = os.path.splitext(os.path.basename(img_path))[0]
 
         img = Image.open(img_path).convert("RGB")
-        ann_path = os.path.join(self.root_path, "annotations", self.split, name + ".txt")
-        keypoints = self._load_keypoints(ann_path, img.size)
+        keypoints = self._points_by_name.get(name, np.empty((0, 2))).copy()
 
         img, keypoints = self.transform(img, keypoints)
 
@@ -112,14 +135,3 @@ class Bird(data.Dataset):
             "keypoints": torch.from_numpy(np.ascontiguousarray(keypoints)).float(),  # (N, 2)
             "density": torch.from_numpy(density).float().unsqueeze(0),  # (1, H/d, W/d)
         }
-
-    @staticmethod
-    def _load_keypoints(path, img_size):
-        w, h = img_size
-        kps = np.loadtxt(path, ndmin=2)
-        if kps.size == 0:
-            return np.empty((0, 2))
-        if kps.shape[1] == 3:
-            # YOLO-style "class x_norm y_norm" → (x, y) in pixels.
-            kps = kps[:, 1:] * np.array([w, h])
-        return kps
