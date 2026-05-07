@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
 
     g = p.add_argument_group("data")
     g.add_argument("--data-path", default="../data", help="dataset root")
-    g.add_argument("--split", default="val", choices=["val", "train", "val_legacy", "train_legacy"])
+    g.add_argument("--split", default="val", choices=["val", "train"])
     g.add_argument(
         "--crop-size", type=int, default=512, help="train crop size (forwarded to Bird; only matters for asserts)"
     )
