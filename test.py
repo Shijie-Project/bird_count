@@ -253,7 +253,7 @@ def main():
 
     out_dir: Optional[Path] = None
     if not args.no_density_map:
-        out_dir = Path(ckpt_path).parent / "density_maps" / Path(ckpt_path).stem
+        out_dir = Path(ckpt_path).parent / "density_maps"
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"Writing density overlays to: {out_dir}")
 

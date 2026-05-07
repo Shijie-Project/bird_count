@@ -119,7 +119,7 @@ class EnvSettings(BaseSettings):
 
     # Data Source: Real RTSP cameras or a looped Demo Video
     source_type: Literal["camera", "video"] = "camera"
-    demo_video_path: Path = Path("../data/bird_count_demo.mp4")
+    demo_video_path: Path = Path("../data/demo.mkv")
 
     enable_monitor: bool = False
     enable_smart_plug: bool = True
