@@ -179,8 +179,12 @@ class Trainer:
         self.model.train()
         meters = {k: AverageMeter() for k in _LOSS_KEYS}
         t0 = time.time()
+        accum_steps = max(1, getattr(self.args, "accum_steps", 1))
+        loader = self.dataloaders["train"]
+        n_batches = len(loader)
 
-        for sample in self.dataloaders["train"]:
+        self.optimizer.zero_grad(set_to_none=True)
+        for step, sample in enumerate(loader):
             inputs = sample["image"].to(self.device, non_blocking=True)
             points = [p.to(self.device, non_blocking=True) for p in sample["keypoints"]]
             gt_density = sample["density"].to(self.device, non_blocking=True)
@@ -189,10 +193,15 @@ class Trainer:
             outputs = self.model(inputs)
             total, parts = self.loss_fn(outputs, gt_density, points)
 
-            self.optimizer.zero_grad(set_to_none=True)
-            total.backward()
-            self.optimizer.step()
-            self.ema.update(self.model)
+            # Scale so the accumulated gradient is the *mean* across micro-batches.
+            (total / accum_steps).backward()
+
+            # Step the optimizer every `accum_steps` batches, plus a final flush
+            # at end-of-epoch for any partial accumulation.
+            if ((step + 1) % accum_steps == 0) or ((step + 1) == n_batches):
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.ema.update(self.model)
 
             self._update_meters(meters, total, parts, outputs, points, N)
 

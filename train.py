@@ -19,6 +19,14 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--checkpoint-dir", default="../ckpts", help="where to write checkpoints")
     g.add_argument("--crop-size", type=int, default=512, help="train crop size (must be divisible by 8)")
     g.add_argument("--batch-size", type=int, default=8)
+    g.add_argument(
+        "--accum-steps",
+        type=int,
+        default=1,
+        help="gradient-accumulation steps; effective batch = batch_size * accum_steps. "
+        "Note: increasing accum_steps reduces optimizer/EMA updates per epoch, so "
+        "consider lowering --ema-decay accordingly (e.g. 0.999 -> 0.996 for accum=4)",
+    )
     g.add_argument("--num-workers", type=int, default=0)
 
     g = p.add_argument_group("optimization")

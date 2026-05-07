@@ -52,8 +52,14 @@ class DMCountLoss(nn.Module):
         flat_sum = outputs.view(N, -1).sum(dim=1)
         outputs_normed = outputs / (flat_sum.view(N, 1, 1, 1) + 1e-6)
 
-        # OT term — DM-Count distribution match via Sinkhorn.
+        # OT term — DM-Count distribution match via Sinkhorn. OT_Loss accumulates
+        # per-sample contributions, so divide by N to make it batch-size invariant
+        # (so `wot` doesn't need rescaling when batch size changes). The other three
+        # terms below are already mean-per-batch.
         ot_loss, wd, ot_obj = self.ot(outputs_normed, outputs, points)
+        ot_loss = ot_loss / N
+        ot_obj = ot_obj / N
+        wd = wd / N
 
         # Global count L1.
         gd_count = torch.tensor([len(p) for p in points], device=outputs.device, dtype=torch.float32)
