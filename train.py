@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--data-dir", default="../data", help="dataset root")
     g.add_argument("--checkpoint-dir", default="../ckpts", help="where to write checkpoints")
     g.add_argument("--crop-size", type=int, default=512, help="train crop size (must be divisible by 8)")
-    g.add_argument("--batch-size", type=int, default=8)
+    g.add_argument("--batch-size", type=int, default=16)
     g.add_argument(
         "--accum-steps",
         type=int,
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
         "Note: increasing accum_steps reduces optimizer/EMA updates per epoch, so "
         "consider lowering --ema-decay accordingly (e.g. 0.999 -> 0.996 for accum=4)",
     )
-    g.add_argument("--num-workers", type=int, default=0)
+    g.add_argument("--num-workers", type=int, default=4)
 
     g = p.add_argument_group("optimization")
     g.add_argument("--lr", type=float, default=1e-5, help="peak learning rate (cosine target)")
