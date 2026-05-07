@@ -16,6 +16,18 @@ class _MonitorTogglable(Protocol):
     def is_enabled(self) -> bool: ...
 
 
+class _RecorderHandler(Protocol):
+    """Duck-typed contract for the per-stream recorder used by ManualTriggerGUI."""
+
+    def toggle(self) -> bool: ...
+
+    def is_enabled(self) -> bool: ...
+
+    def toggle_stream(self, stream_id: int) -> bool: ...
+
+    def is_stream_enabled(self, stream_id: int) -> bool: ...
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -382,11 +394,13 @@ class ManualTriggerGUI:
         status_provider: Optional[Callable[[], dict]] = None,
         master: Optional[tk.Misc] = None,
         name: str = "TriggerGUI",
-        recorder_handler: Optional[_MonitorTogglable] = None,
+        recorder_handler: Optional[_RecorderHandler] = None,
+        on_trigger_all_callback: Optional[Callable[[bool], None]] = None,
     ):
         self.name = name
         self.config = config
         self.on_trigger_callback = on_trigger_callback
+        self.on_trigger_all_callback = on_trigger_all_callback
         self.status_provider = status_provider
         self.master = master
         self.recorder_handler = recorder_handler
@@ -394,9 +408,11 @@ class ManualTriggerGUI:
         self.root: Optional[tk.Misc] = None
         self.status_label: Optional[tk.Label] = None
         self.recorder_btn: Optional[tk.Button] = None
+        self.trigger_all_btn: Optional[tk.Button] = None
 
         self.hijack_states: dict[int, bool] = dict.fromkeys(config.sid_to_ip.keys(), False)
         self.buttons: dict[int, tk.Button] = {}
+        self.rec_buttons: dict[int, tk.Button] = {}
         self.dots: dict[int, tk.Label] = {}
 
         self.stream_to_devices: dict[int, set[str]] = {}
@@ -437,20 +453,35 @@ class ManualTriggerGUI:
             font=("Segoe UI", 12, "bold"),
         ).pack()
 
-        if self.recorder_handler is not None:
-            rec_frame = tk.Frame(self.root, bg=_BG_PAGE)
-            rec_frame.pack(fill="x", padx=10, pady=(10, 0))
-            self.recorder_btn = tk.Button(
-                rec_frame,
-                text="RECORDING: ...",
-                fg="white",
-                relief="flat",
-                font=("Segoe UI", 11, "bold"),
-                height=2,
-                command=self._on_recorder_toggle,
-            )
-            self.recorder_btn.pack(fill="x")
-            self._refresh_recorder_button()
+        if self.on_trigger_all_callback is not None or self.recorder_handler is not None:
+            top_frame = tk.Frame(self.root, bg=_BG_PAGE)
+            top_frame.pack(fill="x", padx=10, pady=(10, 0))
+
+            if self.on_trigger_all_callback is not None:
+                self.trigger_all_btn = tk.Button(
+                    top_frame,
+                    text="TRIGGER ALL: ...",
+                    fg="white",
+                    relief="flat",
+                    font=("Segoe UI", 11, "bold"),
+                    height=2,
+                    command=self._on_trigger_all,
+                )
+                self.trigger_all_btn.pack(fill="x", pady=(0, 4))
+                self._refresh_trigger_all_button()
+
+            if self.recorder_handler is not None:
+                self.recorder_btn = tk.Button(
+                    top_frame,
+                    text="RECORDING: ...",
+                    fg="white",
+                    relief="flat",
+                    font=("Segoe UI", 11, "bold"),
+                    height=2,
+                    command=self._on_recorder_toggle,
+                )
+                self.recorder_btn.pack(fill="x")
+                self._refresh_recorder_button()
 
         grid_container = tk.Frame(self.root, bg=_BG_PAGE)
         grid_container.pack(fill="both", expand=True, padx=10, pady=10)
@@ -495,6 +526,20 @@ class ManualTriggerGUI:
             btn.bind("<Enter>", lambda e, b=btn: b.config(highlightbackground="#3498db"))
             btn.bind("<Leave>", lambda e, b=btn, s=stream_id: self._refresh_button_style(s))
 
+            if self.recorder_handler is not None:
+                rec_btn = tk.Button(
+                    cell,
+                    text="REC",
+                    width=16,
+                    height=1,
+                    relief="flat",
+                    font=("Segoe UI", 9, "bold"),
+                    command=lambda s=stream_id: self._on_rec_click(s),
+                )
+                rec_btn.pack(pady=(2, 0))
+                self.rec_buttons[stream_id] = rec_btn
+                self._refresh_rec_button_style(stream_id)
+
         self.status_label = tk.Label(
             self.root,
             text="Ready...",
@@ -533,6 +578,76 @@ class ManualTriggerGUI:
         for sid in list(self.hijack_states.keys()):
             self.hijack_states[sid] = False
             self._refresh_button_style(sid)
+        self._refresh_trigger_all_button()
+
+    def _on_trigger_all(self):
+        if self.on_trigger_all_callback is None:
+            return
+        target = not any(self.hijack_states.values())
+        for sid in list(self.hijack_states.keys()):
+            self.hijack_states[sid] = target
+            self._refresh_button_style(sid)
+        try:
+            self.on_trigger_all_callback(target)
+        except Exception as e:
+            logger.error(f"[{self.name}] trigger_all callback failed: {e}")
+            return
+        self._refresh_trigger_all_button(target)
+        if self.status_label:
+            label = "ENABLED" if target else "DISABLED"
+            self.status_label.config(
+                text=f"All hijacks {label} at {time.strftime('%H:%M:%S')}",
+                fg="#e67e22" if target else "#2980b9",
+            )
+
+    def _refresh_trigger_all_button(self, state: Optional[bool] = None):
+        if not self.trigger_all_btn:
+            return
+        if state is None:
+            state = any(self.hijack_states.values())
+        if state:
+            self.trigger_all_btn.config(
+                text="TRIGGER ALL: ON  (click to clear)",
+                bg=_DOT_HIJACK,
+                activebackground="#e67e22",
+            )
+        else:
+            self.trigger_all_btn.config(
+                text="TRIGGER ALL: OFF  (click to enable all)",
+                bg=_BG_MONITOR_OFF,
+                activebackground=_BG_MONITOR_OFF_HOVER,
+            )
+
+    def _on_rec_click(self, stream_id: int):
+        if self.recorder_handler is None:
+            return
+        try:
+            new_state = bool(self.recorder_handler.toggle_stream(stream_id))
+        except Exception as e:
+            logger.error(f"[{self.name}] rec toggle failed for {stream_id}: {e}")
+            return
+        self._refresh_rec_button_style(stream_id, new_state)
+        self._refresh_recorder_button()
+        if self.status_label:
+            label = "ON" if new_state else "OFF"
+            self.status_label.config(
+                text=f"Stream {stream_id} Recording {label} at {time.strftime('%H:%M:%S')}",
+                fg="#27ae60" if new_state else "#7f8c8d",
+            )
+
+    def _refresh_rec_button_style(self, stream_id: int, state: Optional[bool] = None):
+        btn = self.rec_buttons.get(stream_id)
+        if not btn or self.recorder_handler is None:
+            return
+        if state is None:
+            try:
+                state = bool(self.recorder_handler.is_stream_enabled(stream_id))
+            except Exception:
+                state = False
+        if state:
+            btn.config(text="REC ●", bg=_BG_MONITOR_ON, fg="white", activebackground=_BG_MONITOR_ON_HOVER)
+        else:
+            btn.config(text="REC", bg="#ffffff", fg="#2c3e50", activebackground="#dddddd")
 
     def _on_recorder_toggle(self):
         if self.recorder_handler is None:
@@ -543,6 +658,8 @@ class ManualTriggerGUI:
             logger.error(f"[{self.name}] recorder toggle failed: {e}")
             return
         self._refresh_recorder_button(new_state)
+        for sid in self.rec_buttons:
+            self._refresh_rec_button_style(sid)
         if self.status_label:
             label = "ON" if new_state else "OFF"
             self.status_label.config(
@@ -602,6 +719,9 @@ class ManualTriggerGUI:
             if now - self._last_status_refresh >= self._status_refresh_interval:
                 self._refresh_status_dots()
                 self._refresh_recorder_button()
+                self._refresh_trigger_all_button()
+                for sid in self.rec_buttons:
+                    self._refresh_rec_button_style(sid)
                 self._last_status_refresh = now
             # Toplevel children are pumped by the master Tk's update(); only call
             # update() on our own root when we own the Tk.

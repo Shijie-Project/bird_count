@@ -89,6 +89,24 @@ class ResultProcess(mp.Process):
             if self.audit:
                 self.audit.log("hijack.enable", stream_id=stream_id)
 
+    def _handle_trigger_all(self, target_state: bool):
+        """Callback for GUI 'Trigger All' button. Forces every known stream to `target_state`."""
+        all_sids = list(self.config.sid_to_ip.keys())
+        if target_state:
+            newly_on = [s for s in all_sids if s not in self.manual_override_streams]
+            self.manual_override_streams.update(all_sids)
+            for sid in newly_on:
+                if self.audit:
+                    self.audit.log("hijack.enable", stream_id=sid, source="trigger_all")
+            logger.info(f"[{self.name}] TRIGGER ALL: enabled hijack on {newly_on}.")
+        else:
+            cleared = sorted(self.manual_override_streams)
+            self.manual_override_streams.clear()
+            for sid in cleared:
+                if self.audit:
+                    self.audit.log("hijack.disable", stream_id=sid, source="trigger_all")
+            logger.info(f"[{self.name}] TRIGGER ALL: cleared hijacks on {cleared}.")
+
     def _handle_cancel_all(self):
         """
         Callback for GUI 'Cancel All' button.
@@ -270,6 +288,7 @@ class ResultProcess(mp.Process):
                 manual_gui = ManualTriggerGUI(
                     self.config,
                     on_trigger_callback=self._handle_manual_trigger,
+                    on_trigger_all_callback=self._handle_trigger_all,
                     status_provider=self._get_active_devices_snapshot,
                     master=interaction_gui.root,
                     recorder_handler=self._find_handler(VideoRecorderHandler),

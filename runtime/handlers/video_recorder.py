@@ -18,16 +18,17 @@ logger = logging.getLogger(__name__)
 
 class VideoRecorderHandler(BaseHandler):
     """
-    Continuously records every stream to disk as fixed-length segments.
+    Continuously records selected streams to disk as fixed-length segments.
 
-    Toggleable at runtime via enable() / disable(); the initial state comes from
-    config.envs.enable_video_recorder. Each stream owns its own cv2.VideoWriter;
-    once a segment exceeds `segment_seconds` of wall time, the writer is released
-    and a new file is opened automatically.
+    Recording state is per-stream: the GUI flips individual streams on/off and
+    the master button is just `enable() = enable every known stream`. The initial
+    state for every stream comes from config.envs.enable_video_recorder.
 
-    Disk I/O happens synchronously inside handle() — the same place the SHM frame
-    view is still valid (ResultProcess only releases the buffer after the handler
-    chain returns), so no copy is required.
+    Each enabled stream owns its own cv2.VideoWriter; once a segment exceeds
+    `segment_seconds` of wall time, the writer is released and a new file is
+    opened automatically. Disk I/O happens synchronously inside handle() — the
+    same place the SHM frame view is still valid (ResultProcess only releases
+    the buffer after the handler chain returns), so no copy is required.
     """
 
     FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
@@ -39,7 +40,9 @@ class VideoRecorderHandler(BaseHandler):
         self.segment_seconds = float(getattr(config.envs, "video_segment_seconds", 300.0))
         self.output_dir = Path(getattr(config.envs, "video_record_dir", "recordings"))
 
-        self._enabled = bool(getattr(config.envs, "enable_video_recorder", False))
+        self._all_stream_ids: set[int] = set(config.sid_to_ip.keys())
+        initial_on = bool(getattr(config.envs, "enable_video_recorder", False))
+        self._enabled_streams: set[int] = set(self._all_stream_ids) if initial_on else set()
 
         # Threading primitives MUST NOT exist before pickling — _thread.lock
         # isn't picklable, which breaks spawn-based mp on Windows. Lazy-create
@@ -64,7 +67,7 @@ class VideoRecorderHandler(BaseHandler):
             self.audit.log(
                 "handler.start",
                 handler=self.name,
-                initial_enabled=self._enabled,
+                initial_streams=sorted(self._enabled_streams),
                 output_dir=str(self.output_dir),
                 segment_seconds=self.segment_seconds,
             )
@@ -76,42 +79,85 @@ class VideoRecorderHandler(BaseHandler):
             self.audit.log("handler.stop", handler=self.name)
             self.audit.close()
 
-    def enable(self) -> bool:
-        if self._enabled:
+    # ------------------------------------------------------------------
+    # Per-stream control (driven by per-stream GUI buttons)
+    # ------------------------------------------------------------------
+
+    def enable_stream(self, sid: int) -> bool:
+        if sid in self._enabled_streams:
             return True
-        self._enabled = True
+        self._enabled_streams.add(sid)
         if self.audit:
-            self.audit.log("recorder.enable")
-        logger.info(f"[{self.name}] Recording turned ON (dir={self.output_dir}).")
+            self.audit.log("recorder.stream_enable", stream_id=sid)
+        logger.info(f"[{self.name}] Recording ON for stream {sid}.")
+        return True
+
+    def disable_stream(self, sid: int) -> bool:
+        if sid not in self._enabled_streams:
+            return False
+        self._enabled_streams.discard(sid)
+        with self._lock:
+            writer = self._writers.pop(sid, None)
+            self._segment_start.pop(sid, None)
+        if writer is not None:
+            self._release_writer(sid, writer)
+        if self.audit:
+            self.audit.log("recorder.stream_disable", stream_id=sid)
+        logger.info(f"[{self.name}] Recording OFF for stream {sid}.")
+        return False
+
+    def toggle_stream(self, sid: int) -> bool:
+        if sid in self._enabled_streams:
+            self.disable_stream(sid)
+            return False
+        self.enable_stream(sid)
+        return True
+
+    def is_stream_enabled(self, sid: int) -> bool:
+        return sid in self._enabled_streams
+
+    # ------------------------------------------------------------------
+    # Aggregate control (driven by the master "RECORDING ALL" button)
+    # ------------------------------------------------------------------
+
+    def enable(self) -> bool:
+        for sid in self._all_stream_ids:
+            self.enable_stream(sid)
         return True
 
     def disable(self) -> bool:
-        if not self._enabled:
+        if not self._enabled_streams:
             return False
-        self._enabled = False
-        with self._lock:
-            self._close_all_writers_locked()
-        if self.audit:
-            self.audit.log("recorder.disable")
-        logger.info(f"[{self.name}] Recording turned OFF.")
+        for sid in list(self._enabled_streams):
+            self.disable_stream(sid)
         return False
 
     def toggle(self) -> bool:
-        return self.disable() if self._enabled else self.enable()
+        """If anything is recording, stop everything; otherwise start everything."""
+        if self._enabled_streams:
+            self.disable()
+            return False
+        self.enable()
+        return True
 
     def is_enabled(self) -> bool:
-        return self._enabled
+        """True iff at least one stream is currently being recorded."""
+        return bool(self._enabled_streams)
+
+    # ------------------------------------------------------------------
+    # Frame ingest
+    # ------------------------------------------------------------------
 
     def handle_batch(self, batch_result: BatchInferenceResult, shm_client: SharedMemoryClient) -> set[tuple[int, int]]:
-        # Skip the SHM frame indexing entirely when disabled.
-        if not self._enabled:
+        # Skip the SHM frame indexing entirely when nothing is being recorded.
+        if not self._enabled_streams:
             return set()
         return super().handle_batch(batch_result, shm_client)
 
     def handle(self, result: InferenceResult, frame: Optional[np.ndarray]):
-        if not self._enabled or frame is None:
-            return
         sid = result.stream_id
+        if sid not in self._enabled_streams or frame is None:
+            return
         now = time.time()
         with self._lock:
             writer = self._writers.get(sid)
@@ -128,6 +174,10 @@ class VideoRecorderHandler(BaseHandler):
                 writer.write(frame)
             except Exception as e:
                 logger.error(f"[{self.name}] write failed on stream {sid}: {e}")
+
+    # ------------------------------------------------------------------
+    # Writer lifecycle
+    # ------------------------------------------------------------------
 
     def _open_new_writer(self, sid: int, now: float) -> Optional[cv2.VideoWriter]:
         try:
