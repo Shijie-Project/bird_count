@@ -13,6 +13,8 @@ from .targets import downsample_count_map, gen_discrete_map
 # Project-wide output stride for the density model. Trainer, Bird, and
 # DMCountLoss must all use the same value, so it lives in one place.
 DOWNSAMPLE_RATIO = 8
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def build_train_transform(
@@ -36,7 +38,7 @@ def build_train_transform(
             T.ColorJitter(*color_jitter),
             T.RandomGamma(gamma_range, gamma_p),
             T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
             T.RandomGaussianNoise(noise_std, noise_p),
         ]
     )
@@ -52,7 +54,7 @@ def build_val_transform(downsample_ratio: int = DOWNSAMPLE_RATIO):
     return T.Compose(
         [
             T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
             T.PadToMultiple(downsample_ratio),
         ],
     )
@@ -107,7 +109,13 @@ class Bird(data.Dataset):
             self._points_by_name[stem] = np.asarray(pts, dtype=np.float64).reshape(-1, 2) if pts else np.empty((0, 2))
 
         img_dir = os.path.join(root_path, "images", split)
-        im_list = [os.path.join(img_dir, str(img["file_name"])) for img in coco.get("images", [])]
+        im_list = sorted(
+            [
+                os.path.join(img_dir, f)
+                for f in os.listdir(img_dir)
+                if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
+            ]
+        )
         self.im_list = sorted(im_list)
         print(f"number of img: {len(self.im_list)}")
 
