@@ -160,6 +160,11 @@ class Trainer:
         raise ValueError(f"unknown checkpoint extension {suffix!r}; expected .tar or .pth")
 
     def _setup_ema(self, resumed_ema_state: Optional[dict]):
+        if not getattr(self.args, "ema", False):
+            self.ema = None
+            if resumed_ema_state is not None:
+                self.logger.info("--ema not set; ignoring EMA state from checkpoint")
+            return
         # EMA must be created AFTER weights are loaded — it deepcopies the model.
         self.ema = ModelEMA(self.model, decay=self.args.ema_decay)
         if resumed_ema_state is not None:
@@ -218,7 +223,8 @@ class Trainer:
             if ((step + 1) % accum_steps == 0) or ((step + 1) == n_batches):
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
-                self.ema.update(self.model)
+                if self.ema is not None:
+                    self.ema.update(self.model)
 
             self._update_meters(meters, total, parts, outputs, points, N)
 
@@ -249,7 +255,7 @@ class Trainer:
 
     @torch.inference_mode()
     def val_epoch(self):
-        eval_model = self.ema.ema
+        eval_model = self.ema.ema if self.ema is not None else self.model
         eval_model.eval()
         residuals = []
         t0 = time.time()
@@ -264,13 +270,14 @@ class Trainer:
         residuals = np.asarray(residuals)
         mse = float(np.sqrt(np.mean(residuals**2)))
         mae = float(np.mean(np.abs(residuals)))
-        self.logger.info(f"Epoch {self.epoch} Val (EMA) | MSE {mse:.2f} | MAE {mae:.2f} | {time.time() - t0:.1f}s")
+        tag = "EMA" if self.ema is not None else "online"
+        self.logger.info(f"Epoch {self.epoch} Val ({tag}) | MSE {mse:.2f} | MAE {mae:.2f} | {time.time() - t0:.1f}s")
 
         if self._is_best(mse, mae):
             self.best_mse, self.best_mae = mse, mae
             self.evals_since_improvement = 0
             best_path = self.save_dir / f"best_ep{self.epoch:04d}_mae{mae:.2f}_mse{mse:.2f}.pth"
-            torch.save(self.ema.ema.state_dict(), best_path)
+            torch.save(eval_model.state_dict(), best_path)
             self.best_save_list.append(best_path)  # rotates older best_*.pth out
             self.logger.info(f"saved best -> {best_path.name}")
         else:
@@ -287,14 +294,13 @@ class Trainer:
 
     def _save_epoch_checkpoint(self):
         path = self.save_dir / f"{self.epoch}_ckpt.tar"
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "model_state_dict": self.model.state_dict(),
-                "ema_state_dict": self.ema.ema.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": (self.scheduler.state_dict() if self.scheduler is not None else None),
-            },
-            path,
-        )
+        ckpt = {
+            "epoch": self.epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": (self.scheduler.state_dict() if self.scheduler is not None else None),
+        }
+        if self.ema is not None:
+            ckpt["ema_state_dict"] = self.ema.ema.state_dict()
+        torch.save(ckpt, path)
         self.save_list.append(str(path))
