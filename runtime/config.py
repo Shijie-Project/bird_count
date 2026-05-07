@@ -138,6 +138,12 @@ class EnvSettings(BaseSettings):
     # Audit log path (JSONL). Empty string disables auditing.
     audit_log_path: str = "logs/audit.jsonl"
 
+    # Continuous video recording. When ON, every stream is written to disk in
+    # fixed-length segments. Toggleable at runtime from the debug GUI.
+    enable_video_recorder: bool = False
+    video_record_dir: str = "recordings"
+    video_segment_seconds: float = 300.0
+
     # Pydantic V2 config
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

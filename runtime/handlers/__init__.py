@@ -8,6 +8,7 @@ from .base import BaseHandler
 from .monitor import MonitorHandler
 from .smart_plug import SmartPlugHandler
 from .speaker import SpeakerHandler
+from .video_recorder import VideoRecorderHandler
 
 
 logger = logging.getLogger(__name__)
@@ -37,5 +38,10 @@ def init_handlers(
     if config.envs.enable_speaker:
         handlers.append(SpeakerHandler(config))
         logger.info("Handler Registered: Speaker")
+
+    # 4. Continuous Video Recorder - always register;
+    # the handler is runtime-toggleable via the debug GUI.
+    handlers.append(VideoRecorderHandler(config))
+    logger.info("Handler Registered: VideoRecorder")
 
     return handlers

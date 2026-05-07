@@ -382,15 +382,18 @@ class ManualTriggerGUI:
         status_provider: Optional[Callable[[], dict]] = None,
         master: Optional[tk.Misc] = None,
         name: str = "TriggerGUI",
+        recorder_handler: Optional[_MonitorTogglable] = None,
     ):
         self.name = name
         self.config = config
         self.on_trigger_callback = on_trigger_callback
         self.status_provider = status_provider
         self.master = master
+        self.recorder_handler = recorder_handler
 
         self.root: Optional[tk.Misc] = None
         self.status_label: Optional[tk.Label] = None
+        self.recorder_btn: Optional[tk.Button] = None
 
         self.hijack_states: dict[int, bool] = dict.fromkeys(config.sid_to_ip.keys(), False)
         self.buttons: dict[int, tk.Button] = {}
@@ -433,6 +436,21 @@ class ManualTriggerGUI:
             bg=_BG_HEADER,
             font=("Segoe UI", 12, "bold"),
         ).pack()
+
+        if self.recorder_handler is not None:
+            rec_frame = tk.Frame(self.root, bg=_BG_PAGE)
+            rec_frame.pack(fill="x", padx=10, pady=(10, 0))
+            self.recorder_btn = tk.Button(
+                rec_frame,
+                text="RECORDING: ...",
+                fg="white",
+                relief="flat",
+                font=("Segoe UI", 11, "bold"),
+                height=2,
+                command=self._on_recorder_toggle,
+            )
+            self.recorder_btn.pack(fill="x")
+            self._refresh_recorder_button()
 
         grid_container = tk.Frame(self.root, bg=_BG_PAGE)
         grid_container.pack(fill="both", expand=True, padx=10, pady=10)
@@ -516,6 +534,43 @@ class ManualTriggerGUI:
             self.hijack_states[sid] = False
             self._refresh_button_style(sid)
 
+    def _on_recorder_toggle(self):
+        if self.recorder_handler is None:
+            return
+        try:
+            new_state = bool(self.recorder_handler.toggle())
+        except Exception as e:
+            logger.error(f"[{self.name}] recorder toggle failed: {e}")
+            return
+        self._refresh_recorder_button(new_state)
+        if self.status_label:
+            label = "ON" if new_state else "OFF"
+            self.status_label.config(
+                text=f"Recording turned {label} at {time.strftime('%H:%M:%S')}",
+                fg="#27ae60" if new_state else "#7f8c8d",
+            )
+
+    def _refresh_recorder_button(self, state: Optional[bool] = None):
+        if not self.recorder_btn or self.recorder_handler is None:
+            return
+        if state is None:
+            try:
+                state = bool(self.recorder_handler.is_enabled())
+            except Exception:
+                state = False
+        if state:
+            self.recorder_btn.config(
+                text="RECORDING: ON  (click to turn OFF)",
+                bg=_BG_MONITOR_ON,
+                activebackground=_BG_MONITOR_ON_HOVER,
+            )
+        else:
+            self.recorder_btn.config(
+                text="RECORDING: OFF  (click to turn ON)",
+                bg=_BG_MONITOR_OFF,
+                activebackground=_BG_MONITOR_OFF_HOVER,
+            )
+
     def _refresh_status_dots(self):
         if not self.status_provider:
             return
@@ -546,6 +601,7 @@ class ManualTriggerGUI:
             now = time.time()
             if now - self._last_status_refresh >= self._status_refresh_interval:
                 self._refresh_status_dots()
+                self._refresh_recorder_button()
                 self._last_status_refresh = now
             # Toplevel children are pumped by the master Tk's update(); only call
             # update() on our own root when we own the Tk.

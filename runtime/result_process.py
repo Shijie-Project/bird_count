@@ -8,6 +8,7 @@ from .audit import AuditLog
 from .config import Config
 from .handlers import BaseHandler
 from .handlers.monitor import MonitorHandler
+from .handlers.video_recorder import VideoRecorderHandler
 from .inference_process import BatchInferenceResult
 from .memory_manager import BufferState, SharedMemoryClient, SharedMemoryConfig
 from .utils import setup_logging
@@ -126,9 +127,9 @@ class ResultProcess(mp.Process):
             except Exception as e:
                 logger.error(f"[{self.name}] cancel_all hook failed: {e}")
 
-    def _find_monitor_handler(self) -> Optional[MonitorHandler]:
+    def _find_handler(self, handler) -> Optional[BaseHandler]:
         for h in self.handlers:
-            if isinstance(h, MonitorHandler):
+            if isinstance(h, handler):
                 return h
         return None
 
@@ -260,7 +261,7 @@ class ResultProcess(mp.Process):
             # new control to the panel happens in gui.py, not here.
             interaction_gui = InteractionGUI.operator_panel(
                 on_cancel_all=self._handle_cancel_all,
-                monitor_handler=self._find_monitor_handler(),
+                monitor_handler=self._find_handler(MonitorHandler),
                 active_devices_provider=self._get_active_devices_snapshot,
             )
             interaction_gui.setup()
@@ -271,6 +272,7 @@ class ResultProcess(mp.Process):
                     on_trigger_callback=self._handle_manual_trigger,
                     status_provider=self._get_active_devices_snapshot,
                     master=interaction_gui.root,
+                    recorder_handler=self._find_handler(VideoRecorderHandler),
                 )
                 manual_gui.setup()
                 # When Cancel All is pressed (from either GUI), wipe the hijack
