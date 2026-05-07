@@ -80,7 +80,7 @@ class Trainer:
         self.datasets = {split: Bird(a.data_dir, a.crop_size, DOWNSAMPLE_RATIO, split) for split in ("train", "val")}
         self.dataloaders = {
             "train": self._make_loader("train", batch_size=a.batch_size, shuffle=True, pin_memory=True),
-            "val": self._make_loader("val", batch_size=a.batch_size, shuffle=False, pin_memory=False),
+            "val": self._make_loader("val", batch_size=1, shuffle=False, pin_memory=False),
         }
 
     def _make_loader(self, split: str, *, batch_size: int, shuffle: bool, pin_memory: bool) -> DataLoader:
