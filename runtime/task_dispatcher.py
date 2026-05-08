@@ -57,6 +57,12 @@ class TaskDispatcher:
         self.inferencers: list[InferenceProcess] = []
         self.consumer: Optional[ResultProcess] = None
 
+        # One warmup event per inference worker. Each worker sets its event
+        # after _init_resource() (incl. GPU warmup); ResultProcess waits on
+        # all of them before mounting the GUI.
+        num_workers = self.config.envs.num_workers_per_gpu
+        self.warmup_events: list = [mp.Event() for _ in range(num_workers)]
+
         # Cumulative restart attempts per logical process slot.
         self._restart_counts: dict[str, int] = {}
 
@@ -90,6 +96,7 @@ class TaskDispatcher:
                 shm_config=shm_config,
                 result_queue=self.result_queue,
                 ack_queue=self.ack_queue,
+                warmup_events=self.warmup_events,
             )
             for handler in init_handlers(self.config, shm_config, ack_queue=self.ack_queue):
                 self.consumer.register_handler(handler)
@@ -103,6 +110,7 @@ class TaskDispatcher:
                     result_queue=self.result_queue,
                     worker_id=i,
                     total_workers=num_workers,
+                    warmup_event=self.warmup_events[i],
                 )
                 self.inferencers.append(worker)
 
@@ -211,6 +219,7 @@ class TaskDispatcher:
             result_queue=self.result_queue,
             worker_id=idx,
             total_workers=num_workers,
+            warmup_event=self.warmup_events[idx],
         )
         self.inferencers[idx] = new_worker
         new_worker.start()
@@ -227,11 +236,14 @@ class TaskDispatcher:
         shm_config = self.shm_manager.get_config()
         # Rebuild consumer + handlers from scratch — handler in-process state (display
         # process, executors, audit fh) was tied to the dead consumer.
+        # Reuse existing warmup events: if all workers are already up they're already
+        # set, so the new consumer's wait returns immediately.
         self.consumer = ResultProcess(
             config=self.config,
             shm_config=shm_config,
             result_queue=self.result_queue,
             ack_queue=self.ack_queue,
+            warmup_events=self.warmup_events,
         )
         for handler in init_handlers(self.config, shm_config, ack_queue=self.ack_queue):
             self.consumer.register_handler(handler)
