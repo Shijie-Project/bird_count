@@ -180,14 +180,17 @@ class VideoRecorderHandler(BaseHandler):
     # ------------------------------------------------------------------
 
     def _open_new_writer(self, sid: int, now: float) -> Optional[cv2.VideoWriter]:
+        # Per-stream subfolder so all segments for a given camera live together,
+        # e.g. recordings/stream_00/20260508_123456.mp4.
+        stream_dir = self.output_dir / f"stream_{sid:02d}"
         try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
+            stream_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to create output dir {self.output_dir}: {e}")
+            logger.error(f"[{self.name}] Failed to create output dir {stream_dir}: {e}")
             return None
 
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
-        path = self.output_dir / f"stream_{sid:02d}_{ts}.mp4"
+        path = stream_dir / f"{ts}.mp4"
         writer = cv2.VideoWriter(str(path), self.FOURCC, self.fps, self.frame_size)
         if not writer.isOpened():
             logger.error(f"[{self.name}] Failed to open writer for {path}")
