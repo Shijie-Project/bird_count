@@ -182,7 +182,7 @@ def run_video(args, model, device):
             # overlay mode
             heatmap, normed = colorize_density(maps[j], w, h)
             overlay_frame = orig_frame.copy()
-            heat_mask = normed > 0.01
+            heat_mask = normed > 0.1
             if black_mask is not None:
                 heat_mask &= ~black_mask
             if heat_mask.any():
@@ -255,6 +255,7 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     model = get_shufflenet_density_model(model_path=CHECKPOINT_PATH, device=device, fuse=True)
+    print(f"Loaded model from {CHECKPOINT_PATH}")
     model.eval()
 
     run_video(args, model, device)

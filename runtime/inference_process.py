@@ -212,7 +212,7 @@ class InferenceProcess(mp.Process):
         heatmap_rgb = self._colormap_lut[indices]  # [B, H, W, 3]
 
         # 4. In-place Blending using Half-Precision to save bandwidth
-        mask = norm_maps.squeeze(1) > 0.01
+        mask = norm_maps.squeeze(1) > 0.1
         res = raw_images.to(torch.float16)  # Result buffer
 
         if mask.any():
