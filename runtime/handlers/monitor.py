@@ -49,8 +49,14 @@ class _InternalMonitorRenderer:
     CHROME_MARGIN_W = 20
     CHROME_MARGIN_H = 80
 
+    # Heatmap overlay tuning. Composed at tile resolution on CPU (cheap because
+    # the tile is ~380x220, not full image resolution).
+    HEATMAP_ALPHA_BG = 0.6
+    HEATMAP_ALPHA_FG = 0.4
+    HEATMAP_THRESHOLD = 0.05
+
     def __init__(self, config: Config, window_name="Bird Detection Dashboard", name="Monitor"):
-        self.rgb_to_bgr = config.envs.show_density_map
+        self.show_density_map = bool(config.envs.show_density_map)
         self.window_name = window_name
         self.name = name
         self.num_streams = config.num_streams
@@ -91,13 +97,16 @@ class _InternalMonitorRenderer:
 
             slices, coords = self.roi_map[sid]
             # Zero-copy fetch from SHM (safe because ResultProcess holds the buffer
-            # in READING state until we ack on the ack_queue).
+            # in READING state until we ack on the ack_queue). Frames are now
+            # always raw BGR — inference no longer overlays in-place.
             frame = shm_client.frames[sid, res.buffer_idx]
-            resized = cv2.resize(frame, (self.tile_w, self.tile_h))
-            if self.rgb_to_bgr:
-                resized = resized[..., ::-1]
+            tile = cv2.resize(frame, (self.tile_w, self.tile_h))
 
-            self.canvas[slices[0], slices[1]] = resized
+            if self.show_density_map and shm_client.density is not None:
+                density = shm_client.density[sid, res.buffer_idx]
+                tile = self._compose_heatmap(tile, density)
+
+            self.canvas[slices[0], slices[1]] = tile
             self._draw_overlay(res, coords)
 
         # Throttled Window Refresh
@@ -118,6 +127,28 @@ class _InternalMonitorRenderer:
             cv2.imshow(self.window_name, self.canvas)
             cv2.waitKey(1)
             self._last_ui_update = now
+
+    def _compose_heatmap(self, tile_bgr: np.ndarray, density: np.ndarray) -> np.ndarray:
+        """Resize density to tile size, normalize, LUT, alpha-blend onto tile_bgr.
+
+        Density comes in as float16 at model-output resolution (H/8, W/8).
+        Compositing at tile size (~380x220) keeps this cheap on CPU.
+        """
+        d = density.astype(np.float32, copy=False)
+        d = cv2.resize(d, (self.tile_w, self.tile_h), interpolation=cv2.INTER_LINEAR)
+        d_min = float(d.min())
+        d_max = float(d.max())
+        if d_max <= d_min:
+            return tile_bgr
+        norm = (d - d_min) / (d_max - d_min + 1e-6)
+        heat = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        mask = norm > self.HEATMAP_THRESHOLD
+        if not mask.any():
+            return tile_bgr
+        blended = cv2.addWeighted(tile_bgr, self.HEATMAP_ALPHA_BG, heat, self.HEATMAP_ALPHA_FG, 0)
+        out = tile_bgr.copy()
+        out[mask] = blended[mask]
+        return out
 
     def _draw_overlay(self, res: InferenceResult, coords: tuple):
         x1, y1, x2, y2 = coords

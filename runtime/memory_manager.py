@@ -46,6 +46,14 @@ class SharedMemoryConfig:
     shape: tuple
     dtype: str
     meta_shape: tuple
+    # Density block: model-output-resolution density maps (H/stride, W/stride),
+    # keyed by the same (stream_id, buffer_idx) as `shape`. InferenceProcess
+    # writes here; MonitorHandler reads to compose the overlay at display time.
+    # The frame block is therefore never written by inference -> raw frames are
+    # always intact for the recorder.
+    density_name: str = ""
+    density_shape: tuple = ()
+    density_dtype: str = "float16"
 
     @property
     def frame_size_mb(self) -> float:
@@ -54,6 +62,12 @@ class SharedMemoryConfig:
     @property
     def meta_size_kb(self) -> float:
         return int(np.prod(self.meta_shape) * METADATA_DTYPE.itemsize) / 1024.0
+
+    @property
+    def density_size_mb(self) -> float:
+        if not self.density_shape:
+            return 0.0
+        return int(np.prod(self.density_shape) * np.dtype(self.density_dtype).itemsize) / (1024 * 1024)
 
 
 class SharedMemoryManager:
@@ -69,6 +83,8 @@ class SharedMemoryManager:
         resolution: tuple,
         channels: int = 3,
         dtype: str = "uint8",
+        density_stride: int = 8,
+        density_dtype: str = "float16",
         name: str = "MemoryManager",
     ):
         self.name = name
@@ -80,21 +96,38 @@ class SharedMemoryManager:
 
         self.shm_name = f"{name_prefix}_frames"
         self.meta_name = f"{name_prefix}_meta"
+        self.density_name = f"{name_prefix}_density"
         self.frame_dtype = dtype
+        self.density_dtype = density_dtype
 
         # Shape: [Stream, Buffer, H, W, C] -> N-B-H-W-C (Optimal for BGR-to-RGB flip)
         self.shape = (num_streams, num_buffers, self.height, self.width, channels)
         self.meta_shape = (num_streams, num_buffers)
 
+        # Density at model-output resolution. Same first two dims as `shape`
+        # so the same (sid, b_idx) pair indexes both blocks. Choosing the
+        # stride-aligned resolution keeps the block ~64x smaller than full res.
+        if self.height % density_stride or self.width % density_stride:
+            raise ValueError(f"resolution {resolution} not divisible by density_stride {density_stride}")
+        self.density_shape = (
+            num_streams,
+            num_buffers,
+            self.height // density_stride,
+            self.width // density_stride,
+        )
+
         self._shm: Optional[shm.SharedMemory] = None
         self._meta_shm: Optional[shm.SharedMemory] = None
+        self._density_shm: Optional[shm.SharedMemory] = None
 
         try:
             self._allocate_memory()
             self._initialize_metadata()
             config = self.get_config()
             logger.info(
-                f"[{self.name}] Frames: {config.frame_size_mb:.2f} MB | Meta: {config.meta_size_kb:.2f} KB | Shape: {self.shape}"
+                f"[{self.name}] Frames: {config.frame_size_mb:.2f} MB | "
+                f"Density: {config.density_size_mb:.2f} MB | "
+                f"Meta: {config.meta_size_kb:.2f} KB | Shape: {self.shape}"
             )
         except Exception as e:
             logger.error(f"[{self.name}] Allocation failed: {e}")
@@ -104,23 +137,34 @@ class SharedMemoryManager:
     def _allocate_memory(self):
         frame_size = int(np.prod(self.shape) * np.dtype(self.frame_dtype).itemsize)
         meta_size = int(np.prod(self.meta_shape) * METADATA_DTYPE.itemsize)
+        density_size = int(np.prod(self.density_shape) * np.dtype(self.density_dtype).itemsize)
 
-        # 1. 尝试分配 Frame 内存
+        # 1. Frame buffer
         try:
             self._shm = shm.SharedMemory(name=self.shm_name, create=True, size=frame_size)
         except FileExistsError:
             logger.warning(f"[{self.name}] '{self.shm_name}' already exists. Attaching to existing block.")
             self._shm = shm.SharedMemory(name=self.shm_name, create=False)
-            # 可选：校验 size 是否一致
             if self._shm.size < frame_size:
                 raise ValueError(f"Existing shm size ({self._shm.size}) is smaller than required ({frame_size})")
 
-        # 2. 尝试分配 Meta 内存
+        # 2. Meta buffer
         try:
             self._meta_shm = shm.SharedMemory(name=self.meta_name, create=True, size=meta_size)
         except FileExistsError:
             logger.warning(f"[{self.name}] '{self.meta_name}' already exists. Attaching to existing block.")
             self._meta_shm = shm.SharedMemory(name=self.meta_name, create=False)
+
+        # 3. Density buffer
+        try:
+            self._density_shm = shm.SharedMemory(name=self.density_name, create=True, size=density_size)
+        except FileExistsError:
+            logger.warning(f"[{self.name}] '{self.density_name}' already exists. Attaching to existing block.")
+            self._density_shm = shm.SharedMemory(name=self.density_name, create=False)
+            if self._density_shm.size < density_size:
+                raise ValueError(
+                    f"Existing density shm size ({self._density_shm.size}) is smaller than required ({density_size})"
+                )
 
     def _initialize_metadata(self):
         """Vectorized initialization of metadata block."""
@@ -138,6 +182,9 @@ class SharedMemoryManager:
             shape=self.shape,
             dtype=self.frame_dtype,
             meta_shape=self.meta_shape,
+            density_name=self.density_name,
+            density_shape=self.density_shape,
+            density_dtype=self.density_dtype,
         )
 
     def _unlink_if_exists(self, name: str):
@@ -151,7 +198,11 @@ class SharedMemoryManager:
 
     def cleanup(self):
         """Mandatory cleanup for Master process."""
-        for resource, label in [(self._shm, "Frame"), (self._meta_shm, "Meta")]:
+        for resource, label in [
+            (self._shm, "Frame"),
+            (self._meta_shm, "Meta"),
+            (self._density_shm, "Density"),
+        ]:
             if resource:
                 try:
                     resource.close()
@@ -173,12 +224,15 @@ class SharedMemoryClient:
         self.config = config
         self.shm: Optional[shm.SharedMemory] = None
         self.meta_shm: Optional[shm.SharedMemory] = None
+        self.density_shm: Optional[shm.SharedMemory] = None
         self.frames: Optional[np.ndarray] = None
         self.metadata: Optional[np.ndarray] = None
+        self.density: Optional[np.ndarray] = None
 
         # OPTIMIZATION: Pre-cached views for each stream
         self.stream_frames: list[np.ndarray] = []
         self.stream_metadata: list[np.ndarray] = []
+        self.stream_density: list[np.ndarray] = []
 
     def connect(self):
         """Attaches to SHM and caches optimized views."""
@@ -196,11 +250,23 @@ class SharedMemoryClient:
             self.meta_shm = shm.SharedMemory(name=self.config.meta_name)
             self.metadata = np.ndarray(self.config.meta_shape, dtype=METADATA_DTYPE, buffer=self.meta_shm.buf)
 
-            # 3. Cache per-stream views
+            # 3. Attach Density Buffer (parallel to frames; same (sid, b_idx) keys).
+            if self.config.density_name and self.config.density_shape:
+                self.density_shm = shm.SharedMemory(name=self.config.density_name)
+                self.density = np.ndarray(
+                    self.config.density_shape,
+                    dtype=self.config.density_dtype,
+                    buffer=self.density_shm.buf,
+                    order="C",
+                )
+
+            # 4. Cache per-stream views
             # This avoids creating a new Python view object inside the frame loop
             num_streams = self.config.meta_shape[0]
             self.stream_frames = [self.frames[i] for i in range(num_streams)]
             self.stream_metadata = [self.metadata[i] for i in range(num_streams)]
+            if self.density is not None:
+                self.stream_density = [self.density[i] for i in range(num_streams)]
 
             logger.debug(f"[{self.name}] Connected to {self.config.name}")
         except Exception as e:
@@ -213,6 +279,8 @@ class SharedMemoryClient:
             self.shm.close()
         if self.meta_shm:
             self.meta_shm.close()
+        if self.density_shm:
+            self.density_shm.close()
         logger.debug(f"[{self.name}] Disconnected.")
 
     def __enter__(self):

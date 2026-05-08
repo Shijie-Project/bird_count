@@ -7,13 +7,12 @@ from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from models import get_model
 
 from .config import Config
 from .memory_manager import BufferState, SharedMemoryClient, SharedMemoryConfig
-from .utils import create_colormap_lut, get_optimal_memory_format, setup_cuda, setup_logging
+from .utils import get_optimal_memory_format, setup_cuda, setup_logging
 
 
 logger = logging.getLogger(__name__)
@@ -99,12 +98,11 @@ class InferenceProcess(mp.Process):
         self._fused_scale = None
         self._fused_bias = None
         self._memory_format = None
-        self._colormap_lut = None
         self._interval = config.frame_interval
 
-        # Pre-allocated pinned host buffer for fast async D2H of the visualization tensor.
-        # Initialized in _init_resource() once we know we are running with CUDA + density map.
-        self._pinned_vis = None
+        # Pre-allocated pinned host buffer for fast async D2H of the density map.
+        # Initialized in _init_resource() once we know we are running with CUDA.
+        self._pinned_density = None
 
     def _init_resource(self):
         """Initializes GPU and SHM resources within the child process context."""
@@ -141,18 +139,16 @@ class InferenceProcess(mp.Process):
             self.shm_client = SharedMemoryClient(self.shm_config)
             self.shm_client.connect()
 
-            self._colormap_lut = create_colormap_lut().to(self.device)
-
-            # Pinned host staging buffer for the largest expected visualization batch.
-            # Pinned memory enables true async DMA on cuda streams, ~1.5-2x faster D2H
-            # for the multi-MB visualization tensor.
-            if self.device.type == "cuda" and self.config.envs.show_density_map:
+            # Pinned host staging buffer for the density-map D2H. Density is at
+            # model-output resolution (H/8, W/8) in float16, so this is ~50 KB
+            # per stream — tiny compared to the old full-res overlay buffer.
+            if self.device.type == "cuda" and self.shm_config.density_shape:
                 max_b = max(1, len(self.assigned_streams))
-                H, W, C = self.shm_config.shape[2:]
-                self._pinned_vis = torch.empty((max_b, H, W, C), dtype=torch.uint8, pin_memory=True)
+                _, _, H_d, W_d = self.shm_config.density_shape
+                self._pinned_density = torch.empty((max_b, H_d, W_d), dtype=torch.float16, pin_memory=True)
                 logger.info(
-                    f"[{self.name}] Allocated pinned D2H buffer: ({max_b}, {H}, {W}, {C}) uint8 "
-                    f"({self._pinned_vis.numel() / (1024 * 1024):.1f} MB)"
+                    f"[{self.name}] Allocated pinned density D2H buffer: ({max_b}, {H_d}, {W_d}) "
+                    f"float16 ({self._pinned_density.numel() * 2 / 1024:.1f} KB)"
                 )
 
             self._warmup_gpu()
@@ -199,35 +195,6 @@ class InferenceProcess(mp.Process):
         input_tensor.mul_(self._fused_scale).add_(self._fused_bias)
 
         return input_tensor, rgb_tensor
-
-    def _apply_overlays_on_gpu(
-        self, density_map: torch.Tensor, raw_images: torch.Tensor, alpha: float = 0.6, beta: float = 0.4
-    ) -> torch.Tensor:
-        """High-performance Heatmap Overlay using Half-Precision and Boolean Indexing."""
-        B, H, W, C = raw_images.shape
-
-        min_max = torch.aminmax(density_map.flatten(2), dim=2, keepdim=True)
-        v_min, v_max = min_max.min.unsqueeze(-1), min_max.max.unsqueeze(-1)  # [B, 1, 1, 1]
-
-        norm_maps_low = (density_map - v_min) / (v_max - v_min + 1e-5)
-
-        # 1. Faster Upsampling
-        norm_maps = F.interpolate(norm_maps_low, size=(H, W), mode="bilinear", align_corners=False)
-
-        # 3. LUT Color Mapping
-        indices = (norm_maps.squeeze(1) * 255.9).long()
-        heatmap_rgb = self._colormap_lut[indices]  # [B, H, W, 3]
-
-        # 4. In-place Blending using Half-Precision to save bandwidth
-        mask = norm_maps.squeeze(1) > 0.1
-        res = raw_images.to(torch.float16)  # Result buffer
-
-        if mask.any():
-            # Boolean indexing limits computation to significant pixels
-            h_rgb_half = heatmap_rgb[mask].half()
-            res[mask] = res[mask].mul_(alpha).add_(h_rgb_half, alpha=beta)
-
-        return res.to(torch.uint8)
 
     def _collect_batch_from_shm(self) -> tuple[np.ndarray | None, np.ndarray, list, list]:
         """Vectorized collection of ready frames from SHM."""
@@ -301,40 +268,31 @@ class InferenceProcess(mp.Process):
                     input_tensor, raw_tensor = self._preprocess_batch_on_gpu(batch_frames)
                     t1 = time.perf_counter()
 
-                    # --- 3. Inference & Rendering ---
+                    # --- 3. Inference ---
                     with torch.inference_mode(), torch.amp.autocast("cuda"):
-                        # Model Inference
-                        density_map = self.model(input_tensor)
-                        # Parallel sum for counts
+                        density_map = self.model(input_tensor)  # (B, 1, H/8, W/8)
                         counts_tensor = torch.sum(density_map, dim=(1, 2, 3))
 
-                        # Conditional visualization
-                        if self.config.envs.show_density_map:
-                            blended_gpu = self._apply_overlays_on_gpu(density_map, raw_tensor)
-
                     # --- 4. Data Transfer (D2H) ---
-                    # Issue the large async D2H first so it overlaps the (synchronous)
-                    # counts transfer that follows. Both run on the current CUDA stream,
-                    # so the .cpu() call below also flushes the pinned copy.
-                    pinned_view = None
-                    if self.config.envs.show_density_map:
-                        if self._pinned_vis is not None:
-                            n = len(sids)
-                            pinned_view = self._pinned_vis[:n]
-                            pinned_view.copy_(blended_gpu, non_blocking=True)
+                    # Density to dedicated SHM block (FP16, ~50KB/stream/frame). Raw
+                    # frames SHM is intentionally NOT written so the recorder always
+                    # reads pristine camera frames; the heatmap is composed lazily
+                    # in MonitorHandler at display time.
+                    density_fp16 = density_map.squeeze(1).to(torch.float16)
+                    pinned_density = None
+                    if self._pinned_density is not None:
+                        n = len(sids)
+                        pinned_density = self._pinned_density[:n]
+                        pinned_density.copy_(density_fp16, non_blocking=True)
 
                     # Move counts to CPU (tiny transfer; this also serializes the prior
                     # non_blocking copy because both use the same default stream).
                     counts_cpu = counts_tensor.cpu().numpy()
 
-                    # Move visualization frames to SHM
-                    if self.config.envs.show_density_map:
-                        if pinned_view is not None:
-                            # Pinned numpy view -> SHM. PCIe DMA already done.
-                            self.shm_client.frames[sids, b_idxs] = pinned_view.numpy()
-                        else:
-                            # CPU fallback (no pinned buffer when not running on CUDA)
-                            self.shm_client.frames[sids, b_idxs] = blended_gpu.cpu().numpy()
+                    if pinned_density is not None:
+                        self.shm_client.density[sids, b_idxs] = pinned_density.numpy()
+                    else:
+                        self.shm_client.density[sids, b_idxs] = density_fp16.cpu().numpy()
 
                     t2 = time.perf_counter()
                     process_time = time.time()
