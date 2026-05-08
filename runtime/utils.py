@@ -1,8 +1,6 @@
 import logging
 import sys
 
-import cv2
-import numpy as np
 import torch
 
 
@@ -71,25 +69,3 @@ def get_optimal_memory_format(device: torch.device) -> torch.memory_format:
 
     _OPTIMAL_MEMORY_FORMAT = target_format
     return target_format
-
-
-def create_colormap_lut() -> torch.Tensor:
-    """
-    Creates a (256, 3) lookup table for JET colormap.
-    Correctly converts BGR (OpenCV default) to RGB to match processed frames.
-
-    Returns:
-        Tensor [256, 3] uint8 in RGB format.
-    """
-    # Create a gradient 0-255
-    gradient = np.arange(256, dtype=np.uint8).reshape(1, 256)
-
-    # 1. Generate colormap using OpenCV (returns BGR)
-    colormap_bgr = cv2.applyColorMap(gradient, cv2.COLORMAP_JET).squeeze(0)
-
-    # 2. ACCELERATION: Convert BGR to RGB to match the GPU-side image format.
-    # colormap_bgr[..., ::-1] is a fast slice to swap B and R channels.
-    colormap_rgb = colormap_bgr[:, ::-1].copy()
-
-    # 3. Ensure the tensor is contiguous for fast indexing on GPU
-    return torch.from_numpy(colormap_rgb).contiguous()
