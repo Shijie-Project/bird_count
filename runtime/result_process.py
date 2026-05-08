@@ -34,12 +34,18 @@ class ResultProcess(mp.Process):
     ACK_TIMEOUT_SEC = 5.0
     MAX_ACKS_PER_DRAIN = 128
 
+    # Upper bound for the GUI mount wait (seconds). Long enough for cudnn
+    # autotune across every batch size, short enough that the GUI still
+    # eventually appears even if a worker is silently stuck.
+    WARMUP_WAIT_TIMEOUT_SEC = 300.0
+
     def __init__(
         self,
         config: Config,
         shm_config: SharedMemoryConfig,
         result_queue: mp.Queue,
         ack_queue: Optional[mp.Queue] = None,
+        warmup_events: "tuple[mp.synchronize.Event, ...] | list[mp.synchronize.Event]" = (),
     ):
         super().__init__(name="ResultConsumer")
         self.config = config
@@ -48,6 +54,10 @@ class ResultProcess(mp.Process):
         self.ack_queue = ack_queue
         self._stop_event = mp.Event()
         self.handlers: list[BaseHandler] = []
+        # One event per inference worker. ResultProcess.run() blocks on these
+        # before mounting the GUI so the operator's first click hits an already-
+        # warm pipeline.
+        self.warmup_events = tuple(warmup_events)
 
         # O(1) Threshold Mapping
         self.stream_thresholds: dict[int, float] = self.config.sid_to_threshold
@@ -250,6 +260,29 @@ class ResultProcess(mp.Process):
             f"[{self.name}] Force-released {len(stale)} stale ack(s) after {self.ACK_TIMEOUT_SEC}s timeout."
         )
 
+    def _wait_for_inference_warmup(self):
+        """Block until every inference worker signals warmup-complete (with timeout)."""
+        if not self.warmup_events:
+            return
+        n = len(self.warmup_events)
+        logger.info(f"[{self.name}] Waiting for {n} inference worker(s) to finish warmup before mounting GUI...")
+        deadline = time.time() + self.WARMUP_WAIT_TIMEOUT_SEC
+        for i, ev in enumerate(self.warmup_events):
+            while not self._stop_event.is_set():
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    logger.warning(
+                        f"[{self.name}] Timed out after {self.WARMUP_WAIT_TIMEOUT_SEC:.0f}s waiting "
+                        f"for InferenceWorker-{i}; mounting GUI anyway."
+                    )
+                    return
+                # Short polling slice so a stop signal is noticed promptly.
+                if ev.wait(timeout=min(0.5, remaining)):
+                    break
+        if self._stop_event.is_set():
+            return
+        logger.info(f"[{self.name}] Inference workers ready. Mounting GUI.")
+
     def run(self):
         """Main consumption loop."""
         setup_logging(self.config.envs.debug)
@@ -265,6 +298,12 @@ class ResultProcess(mp.Process):
 
         for h in self.handlers:
             h.start()
+
+        # Block GUI mount until every inference worker has finished warmup.
+        # Without this the operator panel appears while cudnn is still autotuning,
+        # so the first click ("Cancel All", "Trigger", "REC") sits idle for 1-2s
+        # with no log feedback the user can see.
+        self._wait_for_inference_warmup()
 
         # 2. GUI Setup
         # InteractionGUI (operator-facing): always shown - hosts Cancel All + Monitor toggle.

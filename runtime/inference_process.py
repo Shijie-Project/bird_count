@@ -3,6 +3,7 @@ import multiprocessing as mp
 import queue
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import torch
@@ -67,6 +68,7 @@ class InferenceProcess(mp.Process):
         result_queue: mp.Queue,
         worker_id: int,
         total_workers: int,
+        warmup_event: "Optional[mp.synchronize.Event]" = None,
     ):
         # Unique name for tracing
         super().__init__(name=f"InferenceWorker-{worker_id}")
@@ -76,6 +78,11 @@ class InferenceProcess(mp.Process):
         self.worker_id = worker_id
         self.total_workers = total_workers
         self._stop_event = mp.Event()
+        # Set after _init_resource() finishes (incl. GPU warmup). ResultProcess
+        # blocks on this so its GUI only appears once inference is ready —
+        # otherwise the first user click sits behind 1-2s of warmup with no
+        # log feedback visible to the operator.
+        self.warmup_event = warmup_event
 
         self.is_monitor_mode = getattr(self.config.envs, "monitor_mode", False)
 
@@ -270,6 +277,8 @@ class InferenceProcess(mp.Process):
         """Main Inference Loop."""
         setup_logging(self.config.envs.debug)
         self._init_resource()
+        if self.warmup_event is not None:
+            self.warmup_event.set()
 
         while not self._stop_event.is_set():
             try:
