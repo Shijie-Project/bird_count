@@ -356,7 +356,7 @@ class Config:
         sid_to_threshold = {}
         for zone in self.zones:
             for threshold in zone.thresholds:
-                sid_to_threshold[sid] = threshold
+                sid_to_threshold[sid] = threshold if not self.envs.debug else 1e6
                 sid += 1
         self._sid_to_threshold = sid_to_threshold
         return sid_to_threshold
