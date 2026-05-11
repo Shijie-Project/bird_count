@@ -396,11 +396,13 @@ class ManualTriggerGUI:
         name: str = "TriggerGUI",
         recorder_handler: Optional[_RecorderHandler] = None,
         on_trigger_all_callback: Optional[Callable[[bool], None]] = None,
+        on_terminate_callback: Optional[Callable[[], None]] = None,
     ):
         self.name = name
         self.config = config
         self.on_trigger_callback = on_trigger_callback
         self.on_trigger_all_callback = on_trigger_all_callback
+        self.on_terminate_callback = on_terminate_callback
         self.status_provider = status_provider
         self.master = master
         self.recorder_handler = recorder_handler
@@ -409,6 +411,7 @@ class ManualTriggerGUI:
         self.status_label: Optional[tk.Label] = None
         self.recorder_btn: Optional[tk.Button] = None
         self.trigger_all_btn: Optional[tk.Button] = None
+        self.terminate_btn: Optional[tk.Button] = None
 
         self.hijack_states: dict[int, bool] = dict.fromkeys(config.sid_to_ip.keys(), False)
         self.buttons: dict[int, tk.Button] = {}
@@ -540,6 +543,25 @@ class ManualTriggerGUI:
                 self.rec_buttons[stream_id] = rec_btn
                 self._refresh_rec_button_style(stream_id)
 
+        if self.on_terminate_callback is not None:
+            term_frame = tk.Frame(self.root, bg=_BG_PAGE)
+            term_frame.pack(fill="x", padx=10, pady=(8, 4))
+            self.terminate_btn = tk.Button(
+                term_frame,
+                text="TERMINATE PROGRAM",
+                bg=_BG_CANCEL,
+                fg="white",
+                activebackground=_BG_CANCEL_HOVER,
+                activeforeground="white",
+                relief="flat",
+                font=("Segoe UI", 11, "bold"),
+                height=2,
+                command=self._on_terminate_click,
+            )
+            self.terminate_btn.pack(fill="x")
+            self.terminate_btn.bind("<Enter>", lambda e: self.terminate_btn.config(bg=_BG_CANCEL_HOVER))
+            self.terminate_btn.bind("<Leave>", lambda e: self.terminate_btn.config(bg=_BG_CANCEL))
+
         self.status_label = tk.Label(
             self.root,
             text="Ready...",
@@ -579,6 +601,35 @@ class ManualTriggerGUI:
             self.hijack_states[sid] = False
             self._refresh_button_style(sid)
         self._refresh_trigger_all_button()
+
+    def _on_terminate_click(self):
+        if self.on_terminate_callback is None or not self.terminate_btn:
+            return
+        confirmed = messagebox.askyesno(
+            title="Confirm Terminate",
+            message=(
+                "Shut down the entire bird-count program?\n\n"
+                "This stops capture, inference, recording, alerts, and the GUI. "
+                "Running recordings will be finalized cleanly."
+            ),
+            parent=self.terminate_btn.winfo_toplevel(),
+            icon="warning",
+        )
+        if not confirmed:
+            return
+        try:
+            self.on_terminate_callback()
+        except Exception as e:
+            logger.error(f"[{self.name}] terminate callback failed: {e}")
+            return
+        if self.status_label:
+            self.status_label.config(
+                text=f"Termination requested at {time.strftime('%H:%M:%S')}; shutting down...",
+                fg="#c0392b",
+            )
+        if self.terminate_btn:
+            # Disable so the user can't double-click while shutdown is in flight.
+            self.terminate_btn.config(state="disabled", text="TERMINATING...")
 
     def _on_trigger_all(self):
         if self.on_trigger_all_callback is None:

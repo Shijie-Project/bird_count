@@ -63,6 +63,10 @@ class TaskDispatcher:
         num_workers = self.config.envs.num_workers_per_gpu
         self.warmup_events: list = [mp.Event() for _ in range(num_workers)]
 
+        # Set by the debug GUI's "Terminate Program" button. The supervisor
+        # loop polls this and triggers a clean shutdown when set.
+        self.shutdown_event = mp.Event()
+
         # Cumulative restart attempts per logical process slot.
         self._restart_counts: dict[str, int] = {}
 
@@ -97,6 +101,7 @@ class TaskDispatcher:
                 result_queue=self.result_queue,
                 ack_queue=self.ack_queue,
                 warmup_events=self.warmup_events,
+                shutdown_event=self.shutdown_event,
             )
             for handler in init_handlers(self.config, shm_config, ack_queue=self.ack_queue):
                 self.consumer.register_handler(handler)
@@ -150,6 +155,12 @@ class TaskDispatcher:
         escalate to full system shutdown.
         """
         while self._running:
+            # User-initiated shutdown via the debug GUI's terminate button.
+            if self.shutdown_event.is_set():
+                logger.info(f"[{self.name}] Shutdown requested from GUI; exiting supervisor loop.")
+                self._running = False
+                return
+
             # Grabber
             if self.grabber and not self.grabber.is_alive():
                 if not self._try_restart_grabber():
@@ -244,6 +255,7 @@ class TaskDispatcher:
             result_queue=self.result_queue,
             ack_queue=self.ack_queue,
             warmup_events=self.warmup_events,
+            shutdown_event=self.shutdown_event,
         )
         for handler in init_handlers(self.config, shm_config, ack_queue=self.ack_queue):
             self.consumer.register_handler(handler)

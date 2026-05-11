@@ -46,6 +46,7 @@ class ResultProcess(mp.Process):
         result_queue: mp.Queue,
         ack_queue: Optional[mp.Queue] = None,
         warmup_events: "tuple[mp.synchronize.Event, ...] | list[mp.synchronize.Event]" = (),
+        shutdown_event: "Optional[mp.synchronize.Event]" = None,
     ):
         super().__init__(name="ResultConsumer")
         self.config = config
@@ -58,6 +59,9 @@ class ResultProcess(mp.Process):
         # before mounting the GUI so the operator's first click hits an already-
         # warm pipeline.
         self.warmup_events = tuple(warmup_events)
+        # Set by the GUI's "Terminate Program" button; the dispatcher's
+        # supervisor loop polls it and triggers a clean system shutdown.
+        self.shutdown_event = shutdown_event
 
         # O(1) Threshold Mapping
         self.stream_thresholds: dict[int, float] = self.config.sid_to_threshold
@@ -98,6 +102,17 @@ class ResultProcess(mp.Process):
             logger.info(f"[{self.name}] Manual Hijack ENABLED for Stream {stream_id}. Forcing all alerts to True.")
             if self.audit:
                 self.audit.log("hijack.enable", stream_id=stream_id)
+
+    def _handle_terminate(self):
+        """Callback for GUI 'Terminate Program' button. Signals the dispatcher
+        to break out of its supervisor loop and run the normal cleanup path."""
+        if self.shutdown_event is None:
+            logger.warning(f"[{self.name}] Terminate requested but no shutdown_event was wired.")
+            return
+        logger.info(f"[{self.name}] Terminate requested from debug GUI.")
+        if self.audit:
+            self.audit.log("system.terminate_request", source="debug_gui")
+        self.shutdown_event.set()
 
     def _handle_trigger_all(self, target_state: bool):
         """Callback for GUI 'Trigger All' button. Forces every known stream to `target_state`."""
@@ -328,6 +343,7 @@ class ResultProcess(mp.Process):
                     self.config,
                     on_trigger_callback=self._handle_manual_trigger,
                     on_trigger_all_callback=self._handle_trigger_all,
+                    on_terminate_callback=self._handle_terminate,
                     status_provider=self._get_active_devices_snapshot,
                     master=interaction_gui.root,
                     recorder_handler=self._find_handler(VideoRecorderHandler),
